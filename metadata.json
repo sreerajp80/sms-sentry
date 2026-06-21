@@ -1,0 +1,6 @@
+{
+  "name": "SMS Sentry",
+  "description": "Secure, private, and smart offline SMS organizer with automated spam classification, balance ledger cards, reminder calendar syncs, and peer-to-peer encrypted synchronizations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

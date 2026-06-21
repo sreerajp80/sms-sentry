@@ -1,0 +1,40 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    
+    <!-- Background glow / shadow hint -->
+    <path
+        android:fillColor="#15000000"
+        android:pathData="M54,18 L82,30 C82,54 68,74 54,82 C40,74 26,54 26,30 Z" />
+
+    <!-- Protected Envelope / Message Base Shape -->
+    <!-- Centered envelope container -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M30,38 h48 c3.3,0 6,2.7 6,6 v24 C84,71.3 81.3,74 78,74 H30 c-3.3,0 -6,-2.7 -6,-6 V44 C24,40.7 26.7,38 30,38 Z" />
+
+    <!-- Envelope Flap lines -->
+    <path
+        android:strokeColor="#7E57C2"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M26,42 L54,58 L82,42" />
+
+    <!-- Secure Security Shield Overlay (Right Bottom Corner) -->
+    <!-- Represents smart security filter filtering SMS -->
+    <path
+        android:fillColor="#26A69A"
+        android:pathData="M70,52 L88,58 C88,71.5 79.5,82.5 70,87 C60.5,82.5 52,71.5 52,58 Z" />
+
+    <!-- Shield inner checkmark of safety -->
+    <path
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="3"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M62,70 L67,75 L78,64" />
+
+</vector>
