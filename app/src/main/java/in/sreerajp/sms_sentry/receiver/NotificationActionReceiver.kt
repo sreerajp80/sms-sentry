@@ -6,10 +6,18 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.os.Handler
+import android.os.Looper
 import android.widget.Toast
-import `in`.sreerajp.sms_sentry.MainActivity
+import androidx.core.app.RemoteInput
+import `in`.sreerajp.sms_sentry.data.SMSMessage
 import `in`.sreerajp.sms_sentry.data.SmsDatabase
+import `in`.sreerajp.sms_sentry.data.SmsRepository
+import `in`.sreerajp.sms_sentry.data.SystemSmsStore
+import `in`.sreerajp.sms_sentry.util.DefaultSmsAppManager
+import `in`.sreerajp.sms_sentry.util.SimManager
 import `in`.sreerajp.sms_sentry.util.SmsNotificationHelper
+import `in`.sreerajp.sms_sentry.util.SmsSender
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -48,34 +56,75 @@ class NotificationActionReceiver : BroadcastReceiver() {
                     }
                 }
             }
-            "in.sreerajp.sms_sentry.ACTION_DELETE_MESSAGE" -> {
-                val messageId = intent.getLongExtra("message_id", -1L)
-                if (messageId != -1L) {
+            SmsNotificationHelper.ACTION_REPLY -> {
+                val sender = intent.getStringExtra("sender")
+                val simId = intent.getIntExtra("sim_id", 1)
+                val replyText = RemoteInput.getResultsFromIntent(intent)
+                    ?.getCharSequence(SmsNotificationHelper.KEY_REPLY_TEXT)?.toString()?.trim()
+                val appContext = context.applicationContext
+
+                if (sender.isNullOrBlank() || replyText.isNullOrEmpty()) {
+                    // Nothing to send (e.g. empty submission); the trailing block dismisses the notif.
+                } else if (!DefaultSmsAppManager.isDefault(appContext)) {
+                    Toast.makeText(appContext, "Set SMS Sentry as default to reply.", Toast.LENGTH_SHORT).show()
+                } else {
                     val pendingResult = goAsync()
                     CoroutineScope(Dispatchers.IO).launch {
                         try {
-                            val db = SmsDatabase.getDatabase(context)
-                            db.smsDao.deleteMessageById(messageId)
-                            db.smsDao.deleteTransactionByMessageId(messageId)
-                            db.smsDao.deleteReminderByMessageId(messageId)
+                            val repository = SmsRepository(SmsDatabase.getDatabase(appContext).smsDao)
+                            val systemSmsStore = SystemSmsStore(appContext)
+                            val now = System.currentTimeMillis()
+                            // Mirror to the system Sent box + persist as a Sending row, same as the composer.
+                            val systemId = systemSmsStore.writeSent(sender, replyText, now)
+                            val msgId = repository.processAndInsertMessage(
+                                sender = sender,
+                                body = replyText,
+                                timestamp = now,
+                                simId = simId,
+                                systemId = systemId,
+                                type = SMSMessage.TYPE_SENT,
+                                isRead = true,
+                                status = SMSMessage.STATUS_SENDING
+                            )
+                            try {
+                                val subId = SimManager.subscriptionIdForSlot(appContext, simId)
+                                SmsSender.dispatch(appContext, sender, replyText, msgId, subId)
+                            } catch (e: Exception) {
+                                repository.updateMessageStatus(msgId, SMSMessage.STATUS_FAILED)
+                            }
                         } catch (e: Exception) {
                             e.printStackTrace()
                         } finally {
                             pendingResult.finish()
                         }
                     }
-                    Toast.makeText(context, "SMS Deleted", Toast.LENGTH_SHORT).show()
                 }
             }
-            "in.sreerajp.sms_sentry.ACTION_OPEN_APP" -> {
+            "in.sreerajp.sms_sentry.ACTION_DELETE_MESSAGE" -> {
                 val messageId = intent.getLongExtra("message_id", -1L)
-                val openIntent = Intent(context, MainActivity::class.java).apply {
-                    flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
-                    if (messageId > 0) {
-                        putExtra(SmsNotificationHelper.EXTRA_OPEN_MESSAGE_ID, messageId)
+                if (messageId != -1L) {
+                    val appContext = context.applicationContext
+                    val pendingResult = goAsync()
+                    CoroutineScope(Dispatchers.IO).launch {
+                        var deleted = false
+                        try {
+                            val db = SmsDatabase.getDatabase(appContext)
+                            db.smsDao.deleteMessageById(messageId)
+                            db.smsDao.deleteTransactionByMessageId(messageId)
+                            db.smsDao.deleteReminderByMessageId(messageId)
+                            deleted = true
+                        } catch (e: Exception) {
+                            e.printStackTrace()
+                        } finally {
+                            // Toast on the main thread, only after the delete actually ran.
+                            Handler(Looper.getMainLooper()).post {
+                                val msg = if (deleted) "SMS Deleted" else "Couldn't delete SMS"
+                                Toast.makeText(appContext, msg, Toast.LENGTH_SHORT).show()
+                            }
+                            pendingResult.finish()
+                        }
                     }
                 }
-                context.startActivity(openIntent)
             }
         }
 

@@ -11,6 +11,8 @@
     <uses-permission android:name="android.permission.RECEIVE_WAP_PUSH" />
     <uses-permission android:name="android.permission.READ_CONTACTS" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Enumerate active SIM subscriptions for dual-SIM send routing -->
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <!-- Exact alarms for scheduled SMS delivery; re-arm those alarms after reboot -->
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
@@ -117,6 +119,16 @@
             </intent-filter>
         </receiver>
 
+        <!-- Fires a reminder's due-alert (and ACTION_DONE from the notification). Targeted by class. -->
+        <receiver
+            android:name=".receiver.ReminderAlarmReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="in.sreerajp.sms_sentry.REMINDER_FIRE" />
+                <action android:name="in.sreerajp.sms_sentry.REMINDER_DONE" />
+            </intent-filter>
+        </receiver>
+
         <!-- Re-arms pending scheduled-SMS alarms after a device reboot. -->
         <receiver
             android:name=".receiver.BootReceiver"
@@ -132,7 +144,7 @@
             <intent-filter>
                 <action android:name="in.sreerajp.sms_sentry.ACTION_COPY_OTP" />
                 <action android:name="in.sreerajp.sms_sentry.ACTION_DELETE_MESSAGE" />
-                <action android:name="in.sreerajp.sms_sentry.ACTION_OPEN_APP" />
+                <action android:name="in.sreerajp.sms_sentry.ACTION_REPLY" />
             </intent-filter>
         </receiver>
     </application>

@@ -1,5 +1,7 @@
 # Plan: Enable long-press multi-select in inbox search results
 
+**Status:** completed
+
 ## Issue
 
 In the inbox, the normal (non-search) conversation list supports long-press to enter

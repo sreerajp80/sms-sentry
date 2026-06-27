@@ -68,6 +68,8 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         // The user may have changed the default SMS app from system settings while away.
         viewModel.refreshDefaultStatus()
+        // ...or granted READ_PHONE_STATE / swapped a SIM — re-enumerate for the SIM pickers.
+        viewModel.refreshActiveSims()
     }
 
     /** Parse an sms:/smsto:/mms:/mmsto: ACTION_SENDTO/SEND/VIEW intent into a composer prefill. */
@@ -91,9 +93,25 @@ class MainActivity : ComponentActivity() {
     /** Open the message a tapped notification refers to, if it carries an open-message extra. */
     private fun handleOpenMessageIntent(intent: Intent?) {
         if (intent == null) return
+
+        if (intent.getBooleanExtra(SmsNotificationHelper.EXTRA_OPEN_REMINDERS, false)) {
+            viewModel.openRemindersFromNotification()
+            intent.removeExtra(SmsNotificationHelper.EXTRA_OPEN_REMINDERS)
+        }
+
         val messageId = intent.getLongExtra(SmsNotificationHelper.EXTRA_OPEN_MESSAGE_ID, -1L)
         if (messageId <= 0) return
-        viewModel.openMessageById(messageId)
+        viewModel.openMessageFromNotification(messageId)
+
+        // The "Open" action button launches us directly (no trampoline), so it isn't covered
+        // by setAutoCancel — dismiss its notification here if it asked us to.
+        val cancelId = intent.getIntExtra(SmsNotificationHelper.EXTRA_CANCEL_NOTIFICATION_ID, -1)
+        if (cancelId != -1) {
+            val nm = getSystemService(NOTIFICATION_SERVICE) as android.app.NotificationManager
+            nm.cancel(cancelId)
+            intent.removeExtra(SmsNotificationHelper.EXTRA_CANCEL_NOTIFICATION_ID)
+        }
+
         // Consume the extra so config changes / re-deliveries don't re-open it.
         intent.removeExtra(SmsNotificationHelper.EXTRA_OPEN_MESSAGE_ID)
     }

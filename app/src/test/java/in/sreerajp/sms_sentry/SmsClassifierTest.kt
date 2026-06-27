@@ -5,11 +5,18 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Locale
 
 /** Covers the CONTACT -> "NotSpam" allowlist behaviour added for the "Not spam" action. */
 class SmsClassifierTest {
 
     private val noRules = emptyList<Pair<String, String>>()
+
+    /** Local midnight epoch millis for the given calendar date (mirrors SimpleDateFormat parse). */
+    private fun dateMillis(spec: String): Long =
+        SimpleDateFormat("dd MMM yyyy", Locale.ROOT).parse(spec)!!.time
 
     @Test
     fun `spammy text without allowlist is classified as Spam`() {
@@ -29,6 +36,30 @@ class SmsClassifierTest {
             body = "CONGRATULATIONS! You won a lottery jackpot, claim it now!",
             customKeywords = noRules,
             customContacts = mapOf("PROMO-XY" to "NotSpam")
+        )
+        // Allowlist only suppresses Spam; an alphanumeric header is not Personal, so it
+        // falls back to Others.
+        assertEquals("Others", result.category)
+    }
+
+    @Test
+    fun `alphanumeric header with no keywords is Others, not Personal`() {
+        val result = SmsClassifier.classify(
+            sender = "AD-ITDCPC-S",
+            body = "Dear LALITHAMBIKA LATHIKA, ITR:4 of 2026 for AFXXXXX has been processed.",
+            customKeywords = noRules,
+            customContacts = emptyMap()
+        )
+        assertEquals("Others", result.category)
+    }
+
+    @Test
+    fun `mobile number sender with no keywords is Personal`() {
+        val result = SmsClassifier.classify(
+            sender = "+919876543210",
+            body = "Amit will call you",
+            customKeywords = noRules,
+            customContacts = emptyMap()
         )
         assertEquals("Personal", result.category)
     }
@@ -115,6 +146,84 @@ class SmsClassifierTest {
         )
         assertTrue(result.isFinance)
         assertEquals(true, result.isCredit)
+    }
+
+    @Test
+    fun `hyphenated alpha date in a reminder is parsed as the due date`() {
+        val ref = dateMillis("01 Jan 2026") // before the expiry, so the date is a future deadline
+        val result = SmsClassifier.classify(
+            sender = "VM-MoRTH",
+            body = "Pollution Under Control Certificate (PUCC) of Vehicle No. KL05BD2314 will " +
+                "expire on 16-Jun-2026. Kindly renew the certificate before the expiry date.",
+            customKeywords = noRules,
+            customContacts = emptyMap(),
+            referenceTime = ref
+        )
+        assertTrue("renew/expiry text should flag a reminder", result.isReminder)
+        assertEquals(dateMillis("16 Jun 2026"), result.dueDate)
+    }
+
+    @Test
+    fun `dot and slash separated alpha dates parse identically`() {
+        val ref = dateMillis("01 Jan 2026")
+        val expected = dateMillis("16 Jun 2026")
+        for (sep in listOf("16.Jun.2026", "16/Jun/2026", "16 Jun 2026")) {
+            val result = SmsClassifier.classify(
+                sender = "VM-MoRTH",
+                body = "PUCC will expire on $sep. Kindly renew before expiry.",
+                customKeywords = noRules,
+                customContacts = emptyMap(),
+                referenceTime = ref
+            )
+            assertEquals("separator '$sep' should parse", expected, result.dueDate)
+        }
+    }
+
+    @Test
+    fun `unicode dash separated alpha dates parse identically`() {
+        // MoRTH/government bulk SMS use en/em dashes, not ASCII hyphens. "16–Jun–2026"
+        // is the real-world body that previously fell through to the 3-day fallback.
+        val ref = dateMillis("01 Jan 2026")
+        val expected = dateMillis("16 Jun 2026")
+        for (sep in listOf("16–Jun–2026", "16—Jun—2026", "16−Jun−2026")) {
+            val result = SmsClassifier.classify(
+                sender = "VM-MoRTH",
+                body = "PUCC will expire on $sep. Kindly renew before expiry.",
+                customKeywords = noRules,
+                customContacts = emptyMap(),
+                referenceTime = ref
+            )
+            assertEquals("separator '$sep' should parse", expected, result.dueDate)
+        }
+    }
+
+    @Test
+    fun `year-less alpha date resolves against the message year`() {
+        val ref = dateMillis("01 Mar 2024")
+        val result = SmsClassifier.classify(
+            sender = "VM-XYZ",
+            body = "Your subscription is due on 25 May. Kindly pay before then.",
+            customKeywords = noRules,
+            customContacts = emptyMap(),
+            referenceTime = ref
+        )
+        assertTrue(result.isReminder)
+        val cal = Calendar.getInstance().apply { timeInMillis = result.dueDate!! }
+        assertEquals(2024, cal.get(Calendar.YEAR))
+    }
+
+    @Test
+    fun `reminder with no date falls back to three days from the message time`() {
+        val ref = dateMillis("10 Jun 2026")
+        val result = SmsClassifier.classify(
+            sender = "VM-XYZ",
+            body = "Kindly pay your outstanding amount at the earliest.",
+            customKeywords = noRules,
+            customContacts = emptyMap(),
+            referenceTime = ref
+        )
+        assertTrue(result.isReminder)
+        assertEquals(ref + 3 * 24 * 3600 * 1000L, result.dueDate)
     }
 
     @Test

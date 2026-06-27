@@ -1,5 +1,7 @@
 # Plan: Allow re-locking the balance display from the Dashboard
 
+**Status:** completed
+
 ## Issue
 
 On the Dashboard, the "Available Balance" card can be **unlocked** (via device

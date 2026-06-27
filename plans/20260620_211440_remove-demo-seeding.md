@@ -1,5 +1,7 @@
 # Remove demo seeding entirely
 
+**Status:** completed
+
 ## Issue
 
 On first launch with an empty inbox and no `READ_SMS` permission, the app auto-seeds

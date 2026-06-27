@@ -1,5 +1,7 @@
 # Apply new "Claude Design" Dashboard theme palette
 
+**Status:** completed
+
 ## Source
 `SMSSentry.zip` → `SMS Sentry Dashboard.dc.html`. A Claude Design mockup that defines a
 refined **OKLCH‑based** colour system with 5 schemes (Lavender, High Density, Sage,

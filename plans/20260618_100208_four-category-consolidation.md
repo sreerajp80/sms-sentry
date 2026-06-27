@@ -1,5 +1,7 @@
 # Plan: Consolidate to four categories (Personal / Promotions / Others / Spam) + on-demand re-categorization
 
+**Status:** completed
+
 ## What the issue is
 
 Today messages are classified into **five** free-form string categories — `Personal`,

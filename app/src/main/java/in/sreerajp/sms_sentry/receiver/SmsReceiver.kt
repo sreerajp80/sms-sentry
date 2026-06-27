@@ -8,6 +8,7 @@ import android.util.Log
 import `in`.sreerajp.sms_sentry.data.SmsDatabase
 import `in`.sreerajp.sms_sentry.data.SmsRepository
 import `in`.sreerajp.sms_sentry.util.DefaultSmsAppManager
+import `in`.sreerajp.sms_sentry.util.SimManager
 import `in`.sreerajp.sms_sentry.util.SmsNotificationHelper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -28,10 +29,12 @@ class SmsReceiver : BroadcastReceiver() {
                 val db = SmsDatabase.getDatabase(context)
                 val repository = SmsRepository(db.smsDao)
 
+                // The originating SIM, mapped from the incoming subscription to our 1-based slot.
+                val simId = SimManager.slotForSubscriptionId(context, SimManager.subscriptionIdFromIntent(intent))
+
                 for ((sender, mList) in grouped) {
                     val fullBody = mList.joinToString(separator = "") { it.displayMessageBody ?: "" }
                     val timestamp = mList.first().timestampMillis
-                    val simId = 1 // Default Sim index
 
                     // Process and insert message into internal database asynchronously
                     CoroutineScope(Dispatchers.IO).launch {

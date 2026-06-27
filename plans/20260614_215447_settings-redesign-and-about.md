@@ -1,5 +1,7 @@
 # Settings redesign + About screen
 
+**Status:** completed
+
 ## What this implements
 
 1. Redesign the **Settings** screen to match the new Claude Design mockup

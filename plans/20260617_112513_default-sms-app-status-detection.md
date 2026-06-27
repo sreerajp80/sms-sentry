@@ -1,5 +1,7 @@
 # Plan: Fix "default SMS app" status never reflecting in Settings
 
+**Status:** completed
+
 ## The issue
 
 The user set SMS Sentry as the device default SMS app (confirmed in system

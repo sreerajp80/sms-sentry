@@ -1,5 +1,7 @@
 # Fix signing: use smekeystore.jks for both debug and release
 
+**Status:** completed
+
 ## Issue
 
 `:app:validateSigningDebug` fails:

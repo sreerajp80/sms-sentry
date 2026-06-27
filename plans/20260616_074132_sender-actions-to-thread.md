@@ -1,5 +1,7 @@
 # Move sender-scoped actions from the message detail to the sender (thread) level
 
+**Status:** completed
+
 ## The issue
 
 Tapping a message bubble opens **`MessageDetailScreen`** (a single-message view,

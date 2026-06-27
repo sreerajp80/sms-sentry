@@ -1,5 +1,7 @@
 # Fix: conversation/detail screens draw behind the system status bar
 
+**Status:** completed
+
 ## The issue
 
 On a real phone the conversation (thread) screen's header — back arrow, avatar,

@@ -41,9 +41,31 @@ object SmsClassifier {
     )
 
     // Reminder tags → flags the message as a reminder (due dates), category becomes "Others".
+    // Forward-looking obligations only. Deliberately excludes "scheduled" (appears in *past*
+    // transaction confirmations like "Txn … is Scheduled for <past date>") and bare "due".
     private val REMINDER_KEYWORDS = listOf(
-        "due on", "due date", "pay by", "bill payment", "scheduled", "reminder", "appointment",
-        "expires", "outstanding", "recharge before", "renew"
+        "due on", "due date", "due by", "payment due", "pay by", "last date", "bill due",
+        "outstanding", "overdue", "expires on", "expiring", "expiry", "valid till",
+        "valid until", "validity", "renew", "renewal", "recharge before", "appointment",
+        "reminder", "kindly pay", "please pay"
+    )
+
+    // Strong, unambiguous "you must do something by a date" phrases. Used to override the
+    // receipt exclusion below: a completed-transaction SMS that *also* carries one of these is
+    // still a genuine reminder. Excludes the soft "reminder"/"appointment" cues on purpose.
+    private val STRONG_DUE_KEYWORDS = listOf(
+        "due on", "due date", "due by", "payment due", "pay by", "last date", "bill due",
+        "outstanding", "overdue", "expires on", "expiring", "expiry", "valid till",
+        "valid until", "validity", "renew", "renewal", "recharge before", "kindly pay",
+        "please pay"
+    )
+
+    // Completed-transaction / receipt markers. When one of these is present and there is no
+    // STRONG_DUE_KEYWORD, the message is a confirmation — not an actionable reminder.
+    private val RECEIPT_MARKERS = listOf(
+        "credited", "debited", "thank you for the payment", "payment received",
+        "received your payment", "txn ref", "ref no", " successful", "has been credited",
+        "is credited"
     )
 
     // Unambiguous advertising markers. A genuine bank/transaction SMS won't contain these, so
@@ -82,12 +104,24 @@ object SmsClassifier {
     // Movement verbs that mean money came IN. Anything else (debited/spent/paid/…) is a debit.
     private val creditWords = setOf("credited", "received", "contribution", "refunded", "refund", "deposited", "deposit")
 
-    // Simple date extractors
-    private val dateRegex1 = Pattern.compile(
-        "(\\d{1,2}[-/.]\\d{1,2}[-/.]\\d{2,4})" // DD-MM-YYYY or DD/MM/YY
+    // Simple date extractors.
+    // Date separator characters: ASCII space/dot/slash/hyphen PLUS the Unicode dashes that
+    // bulk SMS (e.g. MoRTH/government senders) often use instead of an ASCII hyphen —
+    // non-breaking hyphen (U+2011), figure dash (U+2012), en dash (U+2013), em dash (U+2014),
+    // and minus sign (U+2212). Without these, "16–Jun–2026" (en dash) fails to match.
+    private const val DATE_SEP = "\\s./\\-\\u2011\\u2012\\u2013\\u2014\\u2212"
+    // ISO yyyy-MM-dd (e.g. "validity is 2027-06-12"). Matched first so the 4-digit year is not
+    // mistaken for a DD-MM-YY date by dateRegex1 (which would turn 2027-06-12 into 27-06-12).
+    private val isoDateRegex = Pattern.compile(
+        "(\\d{4}[$DATE_SEP]\\d{1,2}[$DATE_SEP]\\d{1,2})"
     )
+    private val dateRegex1 = Pattern.compile(
+        "(\\d{1,2}[$DATE_SEP]\\d{1,2}[$DATE_SEP]\\d{2,4})" // DD-MM-YYYY or DD/MM/YY
+    )
+    // Alpha month with flexible separators: "16 Jun 2026", "16-Jun-2026", "16–Jun–2026" (en dash),
+    // "16.Jun.2026", "16/Jun/2026" all match. Separators are normalized to spaces before parsing.
     private val dateRegex2 = Pattern.compile(
-        "(\\d{1,2}\\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\\s*\\d{0,4})",
+        "(\\d{1,2}[$DATE_SEP]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[$DATE_SEP]*\\d{0,4})",
         Pattern.CASE_INSENSITIVE
     )
 
@@ -109,7 +143,11 @@ object SmsClassifier {
         sender: String,
         body: String,
         customKeywords: List<Pair<String, String>>, // list of Keyword -> targetCategory
-        customContacts: Map<String, String> // Map of Phone -> targetCategory (or "Blocked")
+        customContacts: Map<String, String>, // Map of Phone -> targetCategory (or "Blocked")
+        // Reference time for reminder date logic (future/past selection, year-less alpha-date year,
+        // and the tomorrow/today/3-day fallback). Defaults to wall-clock; callers should pass the
+        // message's own timestamp so imported/synced/re-classified messages are dated correctly.
+        referenceTime: Long = System.currentTimeMillis()
     ): ClassificationResult {
         val normalizedBody = body.lowercase(Locale.ROOT)
         val normalizedSender = sender.trim().lowercase(Locale.ROOT)
@@ -124,7 +162,7 @@ object SmsClassifier {
                         return ClassificationResult(category = "Spam", isBlocked = true)
                     // Allowlist: never auto-spam this sender, but still classify normally below.
                     "NotSpam" -> allowlisted = true
-                    else -> return runExtractions(normalizeCategory(category), body, sender)
+                    else -> return runExtractions(normalizeCategory(category), body, sender, referenceTime = referenceTime)
                 }
             }
         }
@@ -134,7 +172,7 @@ object SmsClassifier {
             if (normalizedBody.contains(kw.lowercase(Locale.ROOT))) {
                 val isBlocked = (cat == "Spam" || cat == "Blocked")
                 val finalCat = if (isBlocked) "Spam" else normalizeCategory(cat)
-                return runExtractions(finalCat, body, sender, isBlocked)
+                return runExtractions(finalCat, body, sender, isBlocked, referenceTime)
             }
         }
 
@@ -162,20 +200,43 @@ object SmsClassifier {
         return when {
             // A coupon/offer that happens to mention a money verb ("Rs.300 credited!") is
             // marketing, not a transaction — promo wins over money in this case only.
-            isPromoOffer -> runExtractions("Promotions", body, sender)
-            containsMoneyKeyword -> runExtractions("Others", body, sender)
-            containsReminderKeyword -> runExtractions("Others", body, sender)
-            containsPromoKeyword -> runExtractions("Promotions", body, sender)
-            containsServicesKeyword -> runExtractions("Others", body, sender)
-            else -> runExtractions("Personal", body, sender)
+            isPromoOffer -> runExtractions("Promotions", body, sender, referenceTime = referenceTime)
+            containsMoneyKeyword -> runExtractions("Others", body, sender, referenceTime = referenceTime)
+            containsReminderKeyword -> runExtractions("Others", body, sender, referenceTime = referenceTime)
+            containsPromoKeyword -> runExtractions("Promotions", body, sender, referenceTime = referenceTime)
+            containsServicesKeyword -> runExtractions("Others", body, sender, referenceTime = referenceTime)
+            // Personal is a property of the sender, not the body: only an SMS from a saved
+            // contact or a dialable mobile number is Personal. A saved contact is just a phone
+            // number in the address book, so both reduce to "the sender looks like a phone
+            // number" here. Alphanumeric DLT headers / short codes fall back to Others.
+            looksLikePhoneNumber(sender) -> runExtractions("Personal", body, sender, referenceTime = referenceTime)
+            else -> runExtractions("Others", body, sender, referenceTime = referenceTime)
         }
+    }
+
+    /**
+     * True when [sender] is plausibly a dialable number (digits with optional + / spaces /
+     * dashes / parens). Mirrors `ContactNameResolver.isPhoneNumberLike`; kept local so the
+     * classifier stays free of any `android.*` dependency.
+     */
+    private fun looksLikePhoneNumber(sender: String): Boolean {
+        var digits = 0
+        for (ch in sender) {
+            when {
+                ch.isDigit() -> digits++
+                ch == '+' || ch == ' ' || ch == '-' || ch == '(' || ch == ')' -> {}
+                else -> return false
+            }
+        }
+        return digits >= 3
     }
 
     private fun runExtractions(
         category: String,
         body: String,
         sender: String,
-        isBlocked: Boolean = false
+        isBlocked: Boolean = false,
+        referenceTime: Long = System.currentTimeMillis()
     ): ClassificationResult {
         if (category == "Spam" || isBlocked) {
             return ClassificationResult(category = "Spam", isBlocked = true)
@@ -188,7 +249,14 @@ object SmsClassifier {
         // A promotional coupon is never a ledger transaction, even if it says "credited".
         val isFinance = MONEY_KEYWORDS.any { normalizedBody.contains(it) } &&
                 !isPromotionalOffer(normalizedBody)
-        val isReminder = REMINDER_KEYWORDS.any { normalizedBody.contains(it) } || body.contains("due", true)
+        // A message is a reminder only when it carries a forward-looking obligation keyword and
+        // is not a marketing offer. A completed-transaction receipt ("credited", "payment
+        // received", …) is excluded unless it also carries a strong "do this by <date>" phrase.
+        val hasReminderKeyword = REMINDER_KEYWORDS.any { normalizedBody.contains(it) }
+        val hasStrongDuePhrase = STRONG_DUE_KEYWORDS.any { normalizedBody.contains(it) }
+        val isReceipt = RECEIPT_MARKERS.any { normalizedBody.contains(it) }
+        val isReminder = hasReminderKeyword && !isPromotionalOffer(normalizedBody) &&
+                (!isReceipt || hasStrongDuePhrase)
 
         var bankName: String? = null
         var amount: Double? = null
@@ -207,33 +275,43 @@ object SmsClassifier {
 
         if (isReminder) {
             reminderTitle = "Bill/Task: " + (if (sender.length < 15) sender else sender.take(8) + "...")
-            // Search for date:
-            var parsedTime: Long? = null
+            // Collect every date the body mentions, then pick the most reminder-relevant one:
+            // the earliest *future* date (the actual deadline), falling back to the latest past
+            // date only when no future date exists. This keeps a receipt's past transaction date
+            // from being chosen when a real due/expiry date is also present.
+            val candidates = mutableListOf<Long>()
 
-            // Try DD-MM-YYYY format
+            // ISO yyyy-MM-dd first (so the 4-digit year isn't mis-read as a DD-MM-YY date).
+            val matcherIso = isoDateRegex.matcher(body)
+            while (matcherIso.find()) {
+                parseDate(matcherIso.group(1) ?: "")?.let { candidates.add(it) }
+            }
+
+            // DD-MM-YYYY / DD-MM-YY formats.
             val matcher1 = dateRegex1.matcher(body)
-            if (matcher1.find()) {
-                val dateStr = matcher1.group(1) ?: ""
-                parsedTime = parseDate(dateStr)
+            while (matcher1.find()) {
+                parseDate(matcher1.group(1) ?: "")?.let { candidates.add(it) }
             }
 
-            // Try Alpha Month format (e.g., 25 May)
-            if (parsedTime == null) {
-                val matcher2 = dateRegex2.matcher(body)
-                if (matcher2.find()) {
-                    val dateStr = matcher2.group(1) ?: ""
-                    parsedTime = parseAlphaDate(dateStr)
-                }
+            // Alpha month format (e.g., 25 May, 16-Jun-2026).
+            val matcher2 = dateRegex2.matcher(body)
+            while (matcher2.find()) {
+                parseAlphaDate(matcher2.group(1) ?: "", referenceTime)?.let { candidates.add(it) }
             }
+
+            // Reckon "future"/"past" and the fallback relative to the message's own time so
+            // imported/synced/re-classified messages aren't skewed by the current wall-clock.
+            var parsedTime: Long? = candidates.filter { it >= referenceTime }.minOrNull()
+                ?: candidates.maxOrNull()
 
             // Default tomorrow if not found
             if (parsedTime == null) {
                 if (body.contains("tomorrow", true)) {
-                    parsedTime = System.currentTimeMillis() + 24 * 3600 * 1000L
+                    parsedTime = referenceTime + 24 * 3600 * 1000L
                 } else if (body.contains("today", true)) {
-                    parsedTime = System.currentTimeMillis()
+                    parsedTime = referenceTime
                 } else {
-                    parsedTime = System.currentTimeMillis() + 3 * 24 * 3600 * 1000L // 3 days fallback
+                    parsedTime = referenceTime + 3 * 24 * 3600 * 1000L // 3 days fallback
                 }
             }
             dueDate = parsedTime
@@ -343,7 +421,10 @@ object SmsClassifier {
     }
 
     private fun parseDate(dateStr: String): Long? {
-        val formats = listOf("dd-MM-yyyy", "dd/MM/yyyy", "dd.MM.yyyy", "dd-MM-yy", "dd/MM/yy", "dd.MM.yy")
+        val formats = listOf(
+            "yyyy-MM-dd", "yyyy/MM/dd", "yyyy.MM.dd",
+            "dd-MM-yyyy", "dd/MM/yyyy", "dd.MM.yyyy", "dd-MM-yy", "dd/MM/yy", "dd.MM.yy"
+        )
         for (f in formats) {
             try {
                 val sdf = SimpleDateFormat(f, Locale.ROOT)
@@ -356,19 +437,23 @@ object SmsClassifier {
         return null
     }
 
-    private fun parseAlphaDate(dateStr: String): Long? {
+    private fun parseAlphaDate(dateStr: String, referenceTime: Long = System.currentTimeMillis()): Long? {
+        // Normalize hyphen/dot/slash/Unicode-dash separators to spaces so "16-Jun-2026" and
+        // "16–Jun–2026" (en dash) parse with the space-delimited format list (covers
+        // "16 Jun 2026", "16.Jun.2026", "16/Jun/2026" too).
+        val normalized = dateStr.replace(Regex("[$DATE_SEP]+"), " ").trim()
         val formats = listOf("dd MMM yyyy", "dd MMM", "d MMM yyyy", "d MMM")
-        val currentYear = Calendar.getInstance().get(Calendar.YEAR)
+        val referenceYear = Calendar.getInstance().apply { timeInMillis = referenceTime }.get(Calendar.YEAR)
         for (f in formats) {
             try {
                 val sdf = SimpleDateFormat(f, Locale.ROOT)
                 sdf.isLenient = false
-                val date = sdf.parse(dateStr)
+                val date = sdf.parse(normalized)
                 if (date != null) {
                     val cal = Calendar.getInstance()
                     cal.time = date
                     if (cal.get(Calendar.YEAR) == 1970 && !f.contains("yyyy")) {
-                        cal.set(Calendar.YEAR, currentYear)
+                        cal.set(Calendar.YEAR, referenceYear)
                     }
                     return cal.timeInMillis
                 }

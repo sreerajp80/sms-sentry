@@ -1,5 +1,7 @@
 # Conversation date grouping + open-thread scroll-to-latest
 
+**Status:** completed
+
 ## Issue
 
 1. **No date context in the conversation list.** Each `ConversationCard` shows only a

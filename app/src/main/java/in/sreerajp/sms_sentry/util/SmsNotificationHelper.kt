@@ -8,9 +8,14 @@ import android.content.Intent
 import android.os.Build
 import android.widget.RemoteViews
 import androidx.core.app.NotificationCompat
+import androidx.core.app.RemoteInput
 import `in`.sreerajp.sms_sentry.MainActivity
 import `in`.sreerajp.sms_sentry.R
+import `in`.sreerajp.sms_sentry.data.ReminderSms
 import `in`.sreerajp.sms_sentry.receiver.NotificationActionReceiver
+import `in`.sreerajp.sms_sentry.receiver.ReminderAlarmReceiver
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Locale
 
 object SmsNotificationHelper {
@@ -18,8 +23,26 @@ object SmsNotificationHelper {
     private const val CHANNEL_NAME = "SMS Sentry Messages"
     private const val CHANNEL_DESC = "Receive categorized SMS notifications and OTP actions."
 
+    private const val REMINDER_CHANNEL_ID = "sms_sentry_reminders"
+    private const val REMINDER_CHANNEL_NAME = "Reminder Alerts"
+    private const val REMINDER_CHANNEL_DESC = "Due-date alerts for reminders."
+
+    /** Extra on the MainActivity launch intent telling the app to open the Reminders tab. */
+    const val EXTRA_OPEN_REMINDERS = "in.sreerajp.sms_sentry.OPEN_REMINDERS"
+
+    /** Action + RemoteInput key for inline notification quick-reply. */
+    const val ACTION_REPLY = "in.sreerajp.sms_sentry.ACTION_REPLY"
+    const val KEY_REPLY_TEXT = "in.sreerajp.sms_sentry.KEY_REPLY_TEXT"
+
     /** Extra on the MainActivity launch intent telling the app which message to open on tap. */
     const val EXTRA_OPEN_MESSAGE_ID = "in.sreerajp.sms_sentry.OPEN_MESSAGE_ID"
+
+    /**
+     * Extra carrying the notification id to dismiss once MainActivity handles the open. Used by
+     * the "Open" action button, which launches the Activity directly (no trampoline) and so is
+     * not covered by setAutoCancel (that only fires for the content/body tap).
+     */
+    const val EXTRA_CANCEL_NOTIFICATION_ID = "in.sreerajp.sms_sentry.CANCEL_NOTIFICATION_ID"
 
     private class ThemeColors(
         val primaryColor: Int,
@@ -204,7 +227,7 @@ object SmsNotificationHelper {
             .setContentIntent(pendingContentIntent)
             .setAutoCancel(true)
 
-        if (isOtp && otp != null) {
+        if (otp != null) {
             // Set accessibility and wearable fallback contents
             builder.setContentTitle(otp)
             builder.setContentText("OTP from $sender")
@@ -286,19 +309,117 @@ object SmsNotificationHelper {
             )
             builder.addAction(0, "Delete", pendingDeleteIntent)
 
-            val openIntent = Intent(context, NotificationActionReceiver::class.java).apply {
-                action = "in.sreerajp.sms_sentry.ACTION_OPEN_APP"
-                putExtra("notification_id", notificationId)
-                putExtra("message_id", messageId)
+            // "Open" must launch the Activity directly. Routing it through a BroadcastReceiver
+            // that then calls startActivity() is a notification trampoline, which Android 12+
+            // (targetSdk 31+) silently blocks — so we use getActivity() like the tap intent.
+            val openIntent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+                if (messageId > 0) putExtra(EXTRA_OPEN_MESSAGE_ID, messageId)
+                putExtra(EXTRA_CANCEL_NOTIFICATION_ID, notificationId)
             }
-            val pendingOpenIntent = PendingIntent.getBroadcast(
+            val pendingOpenIntent = PendingIntent.getActivity(
                 context,
                 notificationId + 2,
                 openIntent,
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
             builder.addAction(0, "Open", pendingOpenIntent)
+
+            // Inline quick-reply — only when we can actually send (default SMS app). The reply is
+            // sent + persisted by NotificationActionReceiver; the RemoteInput needs a MUTABLE intent.
+            if (DefaultSmsAppManager.isDefault(context)) {
+                val replyIntent = Intent(context, NotificationActionReceiver::class.java).apply {
+                    action = ACTION_REPLY
+                    putExtra("sender", sender)
+                    putExtra("sim_id", simId)
+                    putExtra("message_id", messageId)
+                    putExtra("notification_id", notificationId)
+                }
+                val pendingReplyIntent = PendingIntent.getBroadcast(
+                    context,
+                    notificationId + 4,
+                    replyIntent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
+                )
+                val remoteInput = RemoteInput.Builder(KEY_REPLY_TEXT).setLabel("Reply").build()
+                val replyAction = NotificationCompat.Action.Builder(0, "Reply", pendingReplyIntent)
+                    .addRemoteInput(remoteInput)
+                    .setAllowGeneratedReplies(true)
+                    .build()
+                builder.addAction(replyAction)
+            }
         }
+
+        notificationManager.notify(notificationId, builder.build())
+    }
+
+    /**
+     * Post a due-date alert for [reminder] on the dedicated reminders channel. Tapping opens the
+     * Reminders tab; "Done" routes to [ReminderAlarmReceiver] to delete the reminder and dismiss.
+     */
+    fun showReminderNotification(context: Context, reminder: ReminderSms) {
+        val notificationManager =
+            context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                REMINDER_CHANNEL_ID,
+                REMINDER_CHANNEL_NAME,
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = REMINDER_CHANNEL_DESC
+                enableLights(true)
+                enableVibration(true)
+            }
+            notificationManager.createNotificationChannel(channel)
+        }
+
+        // Distinct, stable per-reminder id so a re-fire of the same reminder replaces its banner.
+        val notificationId = (reminder.id and 0x7FFFFFFF).toInt()
+
+        val dueText = SimpleDateFormat("EEE, dd MMM yyyy", Locale.getDefault())
+            .format(Date(reminder.dueDate))
+        val body = buildString {
+            append("Due $dueText")
+            if (reminder.body.isNotBlank()) {
+                append(" • ")
+                append(reminder.body.trim())
+            }
+        }
+
+        val contentIntent = Intent(context, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+            putExtra(EXTRA_OPEN_REMINDERS, true)
+        }
+        val pendingContentIntent = PendingIntent.getActivity(
+            context,
+            notificationId,
+            contentIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val doneIntent = Intent(context, ReminderAlarmReceiver::class.java).apply {
+            action = ReminderAlarmReceiver.ACTION_DONE
+            putExtra(ReminderAlarmReceiver.EXTRA_REMINDER_ID, reminder.id)
+            putExtra(ReminderAlarmReceiver.EXTRA_NOTIFICATION_ID, notificationId)
+        }
+        val pendingDoneIntent = PendingIntent.getBroadcast(
+            context,
+            notificationId + 1,
+            doneIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val builder = NotificationCompat.Builder(context, REMINDER_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_REMINDER)
+            .setContentTitle("⏰ ${reminder.title}")
+            .setContentText(body)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setContentIntent(pendingContentIntent)
+            .setAutoCancel(true)
+            .addAction(0, "Done", pendingDoneIntent)
 
         notificationManager.notify(notificationId, builder.build())
     }

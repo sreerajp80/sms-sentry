@@ -20,6 +20,11 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.DriveFileMove
+import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.automirrored.filled.TrendingDown
+import androidx.compose.material.icons.automirrored.filled.TrendingUp
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -31,6 +36,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -42,6 +48,7 @@ import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -67,6 +74,7 @@ import kotlinx.coroutines.launch
 import `in`.sreerajp.sms_sentry.data.FinanceTx
 import `in`.sreerajp.sms_sentry.data.ReminderSms
 import `in`.sreerajp.sms_sentry.data.SMSMessage
+import `in`.sreerajp.sms_sentry.engine.P2PSyncEngine
 import `in`.sreerajp.sms_sentry.engine.SyncState
 import `in`.sreerajp.sms_sentry.ui.theme.ThemeStyle
 import `in`.sreerajp.sms_sentry.ui.theme.HighDensityBackgroundLight
@@ -78,6 +86,9 @@ import `in`.sreerajp.sms_sentry.ui.theme.goodSoftColor
 import `in`.sreerajp.sms_sentry.ui.theme.spamColor
 import `in`.sreerajp.sms_sentry.ui.theme.spamSoftColor
 import `in`.sreerajp.sms_sentry.util.AboutInfo
+import `in`.sreerajp.sms_sentry.util.RecurrenceUtil
+import `in`.sreerajp.sms_sentry.util.SimManager
+import `in`.sreerajp.sms_sentry.util.SmsSegment
 import `in`.sreerajp.sms_sentry.util.loadAboutConfig
 import `in`.sreerajp.sms_sentry.BuildConfig
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -93,6 +104,17 @@ import kotlin.math.roundToInt
  */
 val LocalContactNames = compositionLocalOf { emptyMap<String, String>() }
 
+/**
+ * Sender (phone number) -> saved contact photo Uri, provided once at the app root alongside
+ * [LocalContactNames]. Only senders with a saved photo appear; callers fall back to a monogram
+ * [AvatarTile] for everything else.
+ */
+val LocalContactPhotos = compositionLocalOf { emptyMap<String, android.net.Uri>() }
+
+/** Saved contact photo for [sender], or null when there's no match / no photo. */
+@Composable
+private fun photoUriFor(sender: String): android.net.Uri? = LocalContactPhotos.current[sender]
+
 /** Display name for [sender]: the saved contact name when known, else the raw sender. */
 @Composable
 private fun displayNameFor(sender: String): String =
@@ -103,7 +125,9 @@ private fun displayNameFor(sender: String): String =
 fun SmsOrganizerApp(viewModel: SmsOrganizerViewModel) {
     val context = LocalContext.current
     val currentTab by remember { viewModel.activeTab }
+    val navReminders by viewModel.reminders.collectAsState()
     val contactNames by viewModel.contactNames.collectAsState()
+    val contactPhotos by viewModel.contactPhotos.collectAsState()
 
     // Request vital SMS receiving/reading/sending and notification permissions at startup
     val multiplePermissionsLauncher = rememberLauncherForActivityResult(
@@ -117,6 +141,10 @@ fun SmsOrganizerApp(viewModel: SmsOrganizerViewModel) {
         if (grants[android.Manifest.permission.READ_CONTACTS] == true) {
             viewModel.refreshContactNames()
         }
+        // If we just gained READ_PHONE_STATE, enumerate active SIMs for dual-SIM routing.
+        if (grants[android.Manifest.permission.READ_PHONE_STATE] == true) {
+            viewModel.refreshActiveSims()
+        }
     }
 
     androidx.compose.runtime.LaunchedEffect(Unit) {
@@ -124,7 +152,11 @@ fun SmsOrganizerApp(viewModel: SmsOrganizerViewModel) {
             android.Manifest.permission.RECEIVE_SMS,
             android.Manifest.permission.READ_SMS,
             android.Manifest.permission.SEND_SMS,
-            android.Manifest.permission.READ_CONTACTS
+            // MMS-group dangerous permissions requested explicitly (not relying on SMS-group auto-grant).
+            android.Manifest.permission.RECEIVE_MMS,
+            android.Manifest.permission.RECEIVE_WAP_PUSH,
+            android.Manifest.permission.READ_CONTACTS,
+            android.Manifest.permission.READ_PHONE_STATE
         )
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
             permissionsToRequest.add(android.Manifest.permission.POST_NOTIFICATIONS)
@@ -134,12 +166,14 @@ fun SmsOrganizerApp(viewModel: SmsOrganizerViewModel) {
     
     // Dialog visibility states
     var showComposeDialog by remember { mutableStateOf(false) }
-    var showSimulationSmsDialog by remember { mutableStateOf(false) }
     var showImportDialog by remember { mutableStateOf(false) }
 
     val scrollState = rememberScrollState()
 
-    CompositionLocalProvider(LocalContactNames provides contactNames) {
+    CompositionLocalProvider(
+        LocalContactNames provides contactNames,
+        LocalContactPhotos provides contactPhotos
+    ) {
     Box(modifier = Modifier.fillMaxSize()) {
         Scaffold(
             topBar = {
@@ -178,20 +212,6 @@ fun SmsOrganizerApp(viewModel: SmsOrganizerViewModel) {
                         }
                     },
                     actions = {
-                        IconButton(
-                            onClick = { showSimulationSmsDialog = true },
-                            modifier = Modifier.testTag("simulate_sms_bar_button")
-                        ) {
-                            BadgedBox(
-                                badge = { Badge { Text("+") } }
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Sms,
-                                    contentDescription = "Simulate SMS Incoming",
-                                    tint = MaterialTheme.colorScheme.primary
-                                )
-                            }
-                        }
                         IconButton(
                             onClick = { showComposeDialog = true },
                             modifier = Modifier.testTag("open_composer_bar_button")
@@ -237,7 +257,24 @@ fun SmsOrganizerApp(viewModel: SmsOrganizerViewModel) {
                                     overflow = TextOverflow.Visible
                                 )
                             },
-                            icon = { Icon(imageVector = icon, contentDescription = title) },
+                            icon = {
+                                if (title == "Reminders" && navReminders.isNotEmpty()) {
+                                    BadgedBox(
+                                        badge = {
+                                            Badge(
+                                                containerColor = MaterialTheme.colorScheme.error,
+                                                contentColor = MaterialTheme.colorScheme.onError
+                                            ) {
+                                                Text(navReminders.size.toString())
+                                            }
+                                        }
+                                    ) {
+                                        Icon(imageVector = icon, contentDescription = title)
+                                    }
+                                } else {
+                                    Icon(imageVector = icon, contentDescription = title)
+                                }
+                            },
                             modifier = Modifier.testTag(tag),
                             colors = NavigationBarItemDefaults.colors(
                                 selectedIconColor = MaterialTheme.colorScheme.onPrimary,
@@ -297,13 +334,6 @@ fun SmsOrganizerApp(viewModel: SmsOrganizerViewModel) {
             )
         }
 
-        if (showSimulationSmsDialog) {
-            SimulateSmsDialog(
-                viewModel = viewModel,
-                onDismiss = { showSimulationSmsDialog = false }
-            )
-        }
-
         if (showImportDialog) {
             ImportBackupDialog(
                 viewModel = viewModel,
@@ -346,6 +376,18 @@ fun SmsOrganizerApp(viewModel: SmsOrganizerViewModel) {
                 color = MaterialTheme.colorScheme.background
             ) {
                 MessageDetailScreen(viewModel = viewModel, msg = openedMessage)
+            }
+        }
+
+        // --- Sender info full-screen overlay (opened from the thread overflow menu) ---
+        val openedSenderInfo = viewModel.openedSenderInfo.value
+        if (openedSenderInfo != null) {
+            BackHandler { viewModel.closeSenderInfo() }
+            Surface(
+                modifier = Modifier.fillMaxSize(),
+                color = MaterialTheme.colorScheme.background
+            ) {
+                SenderInfoScreen(viewModel = viewModel, sender = openedSenderInfo)
             }
         }
     }
@@ -953,6 +995,7 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
     val spamMessages by viewModel.spamMessages.collectAsState()
     val transactions by viewModel.transactions.collectAsState()
     val reminders by viewModel.reminders.collectAsState()
+    val drafts by viewModel.drafts.collectAsState()
 
     // Parsed entity (amount / due date) per message, keyed by message id.
     val txByMsg = remember(transactions) { transactions.associateBy { it.messageId } }
@@ -996,6 +1039,7 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
     val selectedSenders = remember { mutableStateListOf<String>() }
     var menuOpen by remember { mutableStateOf(false) }
     var showDeleteSelectedDialog by remember { mutableStateOf(false) }
+    var showMarkReadDialog by remember { mutableStateOf(false) }
     var showMoveSheet by remember { mutableStateOf(false) }
 
     fun clearSelection() {
@@ -1048,10 +1092,7 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
                 modifier = Modifier.weight(1f)
             )
             IconButton(
-                onClick = {
-                    selectedSenders.forEach { viewModel.markConversationRead(it) }
-                    clearSelection()
-                },
+                onClick = { showMarkReadDialog = true },
                 modifier = Modifier.testTag("inbox_mark_read_selected")
             ) {
                 Icon(
@@ -1066,7 +1107,7 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
                 modifier = Modifier.testTag("inbox_move_selected")
             ) {
                 Icon(
-                    imageVector = Icons.Default.DriveFileMove,
+                    imageVector = Icons.AutoMirrored.Filled.DriveFileMove,
                     contentDescription = "Move to folder",
                     tint = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.size(22.dp)
@@ -1117,20 +1158,12 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
                         }
                     )
                     DropdownMenuItem(
-                        text = { Text("Mark as read") },
-                        leadingIcon = { Icon(Icons.Default.DoneAll, contentDescription = null) },
+                        text = { Text("Mark as unread") },
+                        leadingIcon = { Icon(Icons.Default.MarkChatUnread, contentDescription = null) },
                         onClick = {
                             menuOpen = false
-                            selectedSenders.forEach { viewModel.markConversationRead(it) }
+                            selectedSenders.forEach { viewModel.markConversationUnread(it) }
                             clearSelection()
-                        }
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Move to folder") },
-                        leadingIcon = { Icon(Icons.Default.DriveFileMove, contentDescription = null) },
-                        onClick = {
-                            menuOpen = false
-                            showMoveSheet = true
                         }
                     )
                     if (activeInboxFolder == "Spam") {
@@ -1152,14 +1185,6 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
                             menuOpen = false
                             selectedSenders.toList().forEach { viewModel.blockConversation(it) }
                             clearSelection()
-                        }
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Delete", color = spamColor()) },
-                        leadingIcon = { Icon(Icons.Default.Delete, contentDescription = null, tint = spamColor()) },
-                        onClick = {
-                            menuOpen = false
-                            showDeleteSelectedDialog = true
                         }
                     )
                 }
@@ -1261,6 +1286,29 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
             }
         }
       }
+
+        // Confirm dialog for marking selected conversations as read.
+        if (showMarkReadDialog) {
+            val n = selectedSenders.size
+            AlertDialog(
+                onDismissRequest = { showMarkReadDialog = false },
+                title = { Text("Mark $n conversation${if (n == 1) "" else "s"} as read?") },
+                text = {
+                    Text("Every message from the selected " +
+                         "sender${if (n == 1) "" else "s"} will be marked read.")
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        selectedSenders.toList().forEach { viewModel.markConversationRead(it) }
+                        showMarkReadDialog = false
+                        clearSelection()
+                    }) { Text("Mark read") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showMarkReadDialog = false }) { Text("Cancel") }
+                }
+            )
+        }
 
         // Confirm dialog for multi-delete of selected conversations.
         if (showDeleteSelectedDialog) {
@@ -1474,6 +1522,7 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
                         ConversationCard(
                             conversation = conv,
                             entityText = entityText,
+                            draft = drafts[conv.sender]?.takeIf { it.isNotBlank() },
                             selected = conv.sender in selectedSenders,
                             selectionMode = selectionMode,
                             onClick = {
@@ -1597,7 +1646,8 @@ fun SearchResultCard(
                 val senderName = displayNameFor(msg.sender)
                 AvatarTile(
                     label = senderName.take(1).uppercase(Locale.getDefault()),
-                    color = categoryColor
+                    color = categoryColor,
+                    photoUri = photoUriFor(msg.sender)
                 )
                 Spacer(modifier = Modifier.width(12.dp))
                 Text(
@@ -1635,6 +1685,7 @@ fun SearchResultCard(
 fun ConversationCard(
     conversation: Conversation,
     entityText: String?,
+    draft: String?,
     selected: Boolean,
     selectionMode: Boolean,
     onClick: () -> Unit,
@@ -1739,7 +1790,8 @@ fun ConversationCard(
                     val senderName = displayNameFor(conversation.sender)
                     AvatarTile(
                         label = senderName.take(1).uppercase(Locale.getDefault()),
-                        color = categoryColor
+                        color = categoryColor,
+                        photoUri = photoUriFor(conversation.sender)
                     )
                     Spacer(modifier = Modifier.width(12.dp))
                     if (hasUnread) {
@@ -1789,32 +1841,51 @@ fun ConversationCard(
 
                 Spacer(modifier = Modifier.height(8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    if (msg.isMms) {
-                        Icon(
-                            imageVector = Icons.Default.Image,
-                            contentDescription = "MMS",
-                            modifier = Modifier.size(15.dp),
-                            tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
-                        )
-                        Spacer(modifier = Modifier.width(5.dp))
-                    }
-                    if (statusLabel != null) {
+                    if (draft != null) {
+                        // An unsent draft takes over the preview, like a stock SMS app.
                         Text(
-                            text = "$statusLabel · ",
+                            text = "Draft: ",
                             fontSize = 12.sp,
-                            fontWeight = FontWeight.SemiBold,
-                            color = if (msg.status == SMSMessage.STATUS_FAILED) spamColor() else categoryColor
+                            fontWeight = FontWeight.Bold,
+                            color = spamColor()
+                        )
+                        Text(
+                            text = draft,
+                            fontSize = 13.sp,
+                            lineHeight = 19.5.sp,
+                            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.72f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
+                        )
+                    } else {
+                        if (msg.isMms) {
+                            Icon(
+                                imageVector = Icons.Default.Image,
+                                contentDescription = "MMS",
+                                modifier = Modifier.size(15.dp),
+                                tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
+                            )
+                            Spacer(modifier = Modifier.width(5.dp))
+                        }
+                        if (statusLabel != null) {
+                            Text(
+                                text = "$statusLabel · ",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (msg.status == SMSMessage.STATUS_FAILED) spamColor() else categoryColor
+                            )
+                        }
+                        Text(
+                            text = msg.body,
+                            fontSize = 13.sp,
+                            lineHeight = 19.5.sp,
+                            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.72f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                            modifier = Modifier.weight(1f)
                         )
                     }
-                    Text(
-                        text = msg.body,
-                        fontSize = 13.sp,
-                        lineHeight = 19.5.sp,
-                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.72f),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
-                    )
                 }
 
                 if (entityText != null || otp != null) {
@@ -1842,14 +1913,31 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
         allMessages.filter { it.sender == sender }.sortedBy { it.timestamp }
     }
     val categoryColor = categoryColor(threadMessages.lastOrNull()?.category ?: "Personal")
-    var replyText by remember { mutableStateOf("") }
+    // Restore any saved draft for this thread; persist it again when leaving (see DisposableEffect).
+    var replyText by remember(sender) { mutableStateOf(viewModel.draftFor(sender)) }
     val context = LocalContext.current
+
+    DisposableEffect(sender) {
+        onDispose { viewModel.saveDraft(sender, replyText) }
+    }
 
     // Open the thread positioned on the most recent message; also re-pin to the latest
     // after a sent reply or freshly received message.
     val listState = rememberLazyListState()
     LaunchedEffect(sender, threadMessages.size) {
         if (threadMessages.isNotEmpty()) listState.scrollToItem(threadMessages.lastIndex)
+    }
+
+    // Auto-mark the conversation read after a configurable delay on open (0 = Off). Keyed on the
+    // unread count so it re-arms when new unread messages arrive; leaving the thread cancels the
+    // pending mark, so a quick preview doesn't mark anything read.
+    val autoReadDelay by viewModel.autoMarkReadDelaySeconds
+    val unreadInboxCount = threadMessages.count { !it.isRead && it.type == SMSMessage.TYPE_INBOX }
+    LaunchedEffect(sender, autoReadDelay, unreadInboxCount) {
+        if (autoReadDelay > 0 && unreadInboxCount > 0) {
+            kotlinx.coroutines.delay(autoReadDelay * 1000L)
+            viewModel.markConversationRead(sender)
+        }
     }
 
     // --- Multi-select state ---
@@ -1915,6 +2003,42 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                     modifier = Modifier.weight(1f)
                 )
                 IconButton(
+                    onClick = {
+                        if (selectedIds.isNotEmpty()) {
+                            viewModel.markMessagesRead(selectedIds.toList())
+                            clearSelection()
+                        }
+                    },
+                    enabled = selectedIds.isNotEmpty(),
+                    modifier = Modifier.testTag("thread_mark_read_selected")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.DoneAll,
+                        contentDescription = "Mark as read",
+                        tint = if (selectedIds.isNotEmpty()) MaterialTheme.colorScheme.onSurfaceVariant
+                               else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+                IconButton(
+                    onClick = {
+                        if (selectedIds.isNotEmpty()) {
+                            viewModel.markMessagesUnread(selectedIds.toList())
+                            clearSelection()
+                        }
+                    },
+                    enabled = selectedIds.isNotEmpty(),
+                    modifier = Modifier.testTag("thread_mark_unread_selected")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.MarkChatUnread,
+                        contentDescription = "Mark as unread",
+                        tint = if (selectedIds.isNotEmpty()) MaterialTheme.colorScheme.onSurfaceVariant
+                               else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+                IconButton(
                     onClick = { if (selectedIds.isNotEmpty()) showDeleteSelectedDialog = true },
                     enabled = selectedIds.isNotEmpty(),
                     modifier = Modifier.testTag("thread_delete_selected")
@@ -1952,7 +2076,8 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                     color = categoryColor,
                     size = 38.dp,
                     corner = 12.dp,
-                    fontSize = 16.sp
+                    fontSize = 16.sp,
+                    photoUri = photoUriFor(sender)
                 )
                 Spacer(modifier = Modifier.width(10.dp))
                 Column(modifier = Modifier.weight(1f)) {
@@ -2022,6 +2147,28 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                                 selectionMode = true
                             }
                         )
+                        DropdownMenuItem(
+                            text = { Text("Sender info") },
+                            leadingIcon = {
+                                Icon(Icons.Default.Info, contentDescription = null)
+                            },
+                            onClick = {
+                                menuOpen = false
+                                viewModel.openSenderInfo(sender)
+                            }
+                        )
+                        if (viewModel.isUnknownContact(sender)) {
+                            DropdownMenuItem(
+                                text = { Text("Add to contacts") },
+                                leadingIcon = {
+                                    Icon(Icons.Default.PersonAdd, contentDescription = null)
+                                },
+                                onClick = {
+                                    menuOpen = false
+                                    viewModel.addToContacts(sender)
+                                }
+                            )
+                        }
                         DropdownMenuItem(
                             text = { Text("Block sender") },
                             leadingIcon = {
@@ -2121,7 +2268,8 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                     onLongClick = {
                         if (!selectionMode) selectionMode = true
                         toggle(msg.id)
-                    }
+                    },
+                    onRetry = { viewModel.resendMessage(msg) }
                 )
             }
         }
@@ -2130,10 +2278,19 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
 
         // Reply composer — only when this app is the default SMS app.
         if (viewModel.canSendSms) {
+            Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp)) {
+            // Segment counter — only once the reply spills into multiple SMS or nears a part limit.
+            val seg = SmsSegment.info(replyText)
+            if (SmsSegment.shouldShow(seg)) {
+                Text(
+                    text = SmsSegment.label(seg),
+                    fontSize = 10.sp,
+                    color = if (seg.isUnicode) categoryColor else MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 10.dp, bottom = 4.dp)
+                )
+            }
             Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
@@ -2169,8 +2326,9 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                 IconButton(
                     onClick = {
                         if (canSend) {
-                            viewModel.sendSms(sender, replyText.trim(), 1)
+                            viewModel.sendSms(sender, replyText.trim(), viewModel.defaultOutgoingSlot())
                             replyText = ""
+                            viewModel.clearDraft(sender)
                         }
                     },
                     enabled = canSend,
@@ -2183,12 +2341,13 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                         .testTag("thread_send_button")
                 ) {
                     Icon(
-                        imageVector = Icons.Default.Send,
+                        imageVector = Icons.AutoMirrored.Filled.Send,
                         contentDescription = "Send",
                         tint = if (canSend) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
                         modifier = Modifier.size(18.dp)
                     )
                 }
+            }
             }
         } else {
             Row(
@@ -2222,9 +2381,12 @@ private fun ThreadBubble(
     selected: Boolean,
     selectionMode: Boolean,
     onClick: () -> Unit,
-    onLongClick: () -> Unit
+    onLongClick: () -> Unit,
+    onRetry: () -> Unit
 ) {
     val isSent = msg.type == SMSMessage.TYPE_SENT
+    val isUnreadIncoming = !msg.isRead && msg.type == SMSMessage.TYPE_INBOX
+    val accentColor = categoryColor(msg.category)
     val bubbleColor = if (isSent) MaterialTheme.colorScheme.primary
                       else MaterialTheme.colorScheme.surfaceVariant
     val textColor = if (isSent) MaterialTheme.colorScheme.onPrimary
@@ -2260,51 +2422,76 @@ private fun ThreadBubble(
             horizontalAlignment = if (isSent) Alignment.End else Alignment.Start,
             modifier = Modifier.fillMaxWidth(0.82f)
         ) {
-            Box(
-                modifier = Modifier
-                    .clip(
-                        RoundedCornerShape(
-                            topStart = 16.dp,
-                            topEnd = 16.dp,
-                            bottomEnd = if (isSent) 4.dp else 16.dp,
-                            bottomStart = if (isSent) 16.dp else 4.dp
-                        )
-                    )
-                    .background(bubbleColor)
-                    .combinedClickable(onClick = onClick, onLongClick = onLongClick)
-                    .padding(horizontal = 13.dp, vertical = 9.dp)
+            Row(
+                modifier = Modifier.height(IntrinsicSize.Min),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Column {
-                    if (msg.isMms && !msg.attachmentUri.isNullOrBlank()) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                imageVector = Icons.Default.Image,
-                                contentDescription = "Attachment",
-                                tint = textColor,
-                                modifier = Modifier.size(15.dp)
-                            )
-                            Spacer(modifier = Modifier.width(5.dp))
-                            Text(
-                                "Attachment",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = textColor.copy(alpha = 0.8f)
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(4.dp))
-                    }
-                    Text(
-                        text = msg.body,
-                        fontSize = 13.5.sp,
-                        lineHeight = 19.sp,
-                        color = textColor
+                // Leading accent bar marks an unread incoming message (clears on read).
+                if (isUnreadIncoming) {
+                    Box(
+                        modifier = Modifier
+                            .width(3.dp)
+                            .fillMaxHeight()
+                            .clip(RoundedCornerShape(2.dp))
+                            .background(accentColor)
                     )
+                    Spacer(modifier = Modifier.width(6.dp))
+                }
+                Box(
+                    modifier = Modifier
+                        .clip(
+                            RoundedCornerShape(
+                                topStart = 16.dp,
+                                topEnd = 16.dp,
+                                bottomEnd = if (isSent) 4.dp else 16.dp,
+                                bottomStart = if (isSent) 16.dp else 4.dp
+                            )
+                        )
+                        .background(bubbleColor)
+                        .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+                        .padding(horizontal = 13.dp, vertical = 9.dp)
+                ) {
+                    Column {
+                        if (msg.isMms && !msg.attachmentUri.isNullOrBlank()) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Default.Image,
+                                    contentDescription = "Attachment",
+                                    tint = textColor,
+                                    modifier = Modifier.size(15.dp)
+                                )
+                                Spacer(modifier = Modifier.width(5.dp))
+                                Text(
+                                    "Attachment",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    color = textColor.copy(alpha = 0.8f)
+                                )
+                            }
+                            Spacer(modifier = Modifier.height(4.dp))
+                        }
+                        Text(
+                            text = msg.body,
+                            fontSize = 13.5.sp,
+                            lineHeight = 19.sp,
+                            color = textColor
+                        )
+                    }
                 }
             }
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.padding(top = 2.dp, start = 4.dp, end = 4.dp)
             ) {
+                if (isUnreadIncoming) {
+                    Box(
+                        modifier = Modifier
+                            .size(8.dp)
+                            .clip(CircleShape)
+                            .background(accentColor)
+                    )
+                    Spacer(modifier = Modifier.width(5.dp))
+                }
                 Text(
                     text = timeText,
                     fontSize = 9.5.sp,
@@ -2317,6 +2504,16 @@ private fun ThreadBubble(
                         fontWeight = FontWeight.SemiBold,
                         color = if (msg.status == SMSMessage.STATUS_FAILED) spamColor()
                                 else MaterialTheme.colorScheme.onBackground.copy(alpha = 0.55f)
+                    )
+                }
+                // A failed send can be retried in place.
+                if (msg.status == SMSMessage.STATUS_FAILED) {
+                    Text(
+                        text = " · Tap to retry",
+                        fontSize = 9.5.sp,
+                        fontWeight = FontWeight.Bold,
+                        color = accentColor,
+                        modifier = Modifier.clickable(enabled = !selectionMode) { onRetry() }
                     )
                 }
             }
@@ -2341,7 +2538,7 @@ fun detectOtp(body: String): String? {
 
 /** Indian-grouped rupee formatter; drops the decimals when the amount is a whole number. */
 fun formatRupees(amount: Double): String {
-    val nf = java.text.NumberFormat.getNumberInstance(Locale("en", "IN")).apply {
+    val nf = java.text.NumberFormat.getNumberInstance(Locale.Builder().setLanguage("en").setRegion("IN").build()).apply {
         maximumFractionDigits = if (amount % 1.0 == 0.0) 0 else 2
         minimumFractionDigits = if (amount % 1.0 == 0.0) 0 else 2
     }
@@ -2397,15 +2594,300 @@ fun InboxFilterPill(label: String, count: Int, selected: Boolean, color: Color, 
 }
 
 @Composable
-fun AvatarTile(label: String, color: Color, size: Dp = 44.dp, corner: Dp = 13.dp, fontSize: TextUnit = 17.sp) {
+fun AvatarTile(
+    label: String,
+    color: Color,
+    size: Dp = 44.dp,
+    corner: Dp = 13.dp,
+    fontSize: TextUnit = 17.sp,
+    photoUri: android.net.Uri? = null
+) {
+    val shape = RoundedCornerShape(corner)
     Box(
         modifier = Modifier
             .size(size)
-            .clip(RoundedCornerShape(corner))
+            .clip(shape)
             .background(color.copy(alpha = 0.16f)),
         contentAlignment = Alignment.Center
     ) {
-        Text(label, fontWeight = FontWeight.ExtraBold, color = color, fontSize = fontSize)
+        if (photoUri != null) {
+            coil.compose.AsyncImage(
+                model = photoUri,
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize().clip(shape),
+                contentScale = ContentScale.Crop
+            )
+        } else {
+            Text(label, fontWeight = FontWeight.ExtraBold, color = color, fontSize = fontSize)
+        }
+    }
+}
+
+// ==========================================
+// SCREEN: SENDER INFO (aggregated per-sender view, opened from the thread overflow menu)
+// ==========================================
+@Composable
+fun SenderInfoScreen(viewModel: SmsOrganizerViewModel, sender: String) {
+    val context = LocalContext.current
+    val allMessages by viewModel.allMessages.collectAsState()
+    val msgs = remember(allMessages, sender) { allMessages.filter { it.sender == sender } }
+
+    val senderName = displayNameFor(sender)
+    val photoUri = photoUriFor(sender)
+    val accent = categoryColor(msgs.maxByOrNull { it.timestamp }?.category ?: "Personal")
+
+    val received = msgs.count { it.type == SMSMessage.TYPE_INBOX }
+    val sent = msgs.count { it.type == SMSMessage.TYPE_SENT }
+    val firstSeen = msgs.minByOrNull { it.timestamp }?.timestamp
+    val lastSeen = msgs.maxByOrNull { it.timestamp }?.timestamp
+    val byCategory = remember(msgs) {
+        msgs.groupingBy { it.category }.eachCount().entries.sortedByDescending { it.value }
+    }
+    val isBlocked = msgs.any { it.isBlocked }
+    val isSpam = msgs.isNotEmpty() && msgs.all { it.category == "Spam" }
+    val muted = viewModel.isMuted(sender)
+    val dateFmt = remember { SimpleDateFormat("d MMM yyyy, hh:mm a", Locale.getDefault()) }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .statusBarsPadding()
+            .navigationBarsPadding()
+            .background(MaterialTheme.colorScheme.background)
+            .testTag("sender_info_${sender}")
+    ) {
+        // Header
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(start = 6.dp, end = 8.dp, top = 6.dp, bottom = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(
+                onClick = { viewModel.closeSenderInfo() },
+                modifier = Modifier.testTag("sender_info_back_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.ArrowBackIosNew,
+                    contentDescription = "Back",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(20.dp)
+                )
+            }
+            Text(
+                text = "Sender info",
+                fontWeight = FontWeight.ExtraBold,
+                fontSize = 15.5.sp,
+                color = MaterialTheme.colorScheme.onBackground,
+                modifier = Modifier.weight(1f)
+            )
+        }
+        HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            AvatarTile(
+                label = senderName.take(1).uppercase(Locale.getDefault()),
+                color = accent,
+                size = 84.dp,
+                corner = 26.dp,
+                fontSize = 34.sp,
+                photoUri = photoUri
+            )
+            Spacer(modifier = Modifier.height(12.dp))
+            Text(
+                text = senderName,
+                fontWeight = FontWeight.ExtraBold,
+                fontSize = 19.sp,
+                color = MaterialTheme.colorScheme.onBackground,
+                textAlign = TextAlign.Center
+            )
+            if (senderName != sender) {
+                Text(
+                    text = sender,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.55f)
+                )
+            }
+
+            // Status chips (only those currently active)
+            if (muted || isBlocked || isSpam) {
+                Spacer(modifier = Modifier.height(10.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (muted) SenderStatusChip("Muted", Icons.Default.NotificationsOff, MaterialTheme.colorScheme.primary)
+                    if (isBlocked) SenderStatusChip("Blocked", Icons.Default.Block, spamColor())
+                    if (isSpam) SenderStatusChip("Spam", Icons.Default.Report, spamColor())
+                }
+            }
+
+            Spacer(modifier = Modifier.height(18.dp))
+
+            // Stats card
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(1.dp, accent.copy(alpha = 0.35f))
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    SenderInfoRow("Total messages", msgs.size.toString())
+                    SenderInfoRow("Received", received.toString())
+                    SenderInfoRow("Sent", sent.toString())
+                    firstSeen?.let { SenderInfoRow("First seen", dateFmt.format(Date(it))) }
+                    lastSeen?.let { SenderInfoRow("Last seen", dateFmt.format(Date(it))) }
+                }
+            }
+
+            if (byCategory.isNotEmpty()) {
+                Spacer(modifier = Modifier.height(14.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    shape = RoundedCornerShape(20.dp),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(
+                            text = "By category",
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
+                        byCategory.forEach { (category, count) ->
+                            val color = categoryColor(category)
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 5.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .size(10.dp)
+                                        .clip(CircleShape)
+                                        .background(color)
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Text(
+                                    text = category,
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onBackground,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                Text(
+                                    text = count.toString(),
+                                    fontSize = 14.sp,
+                                    fontWeight = FontWeight.ExtraBold,
+                                    color = color
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.height(18.dp))
+
+            // Quick actions
+            if (viewModel.isUnknownContact(sender)) {
+                SenderActionButton("Add to contacts", Icons.Default.PersonAdd) {
+                    viewModel.addToContacts(sender)
+                }
+                Spacer(modifier = Modifier.height(10.dp))
+            }
+            SenderActionButton(
+                label = if (muted) "Unmute notifications" else "Mute notifications",
+                icon = Icons.Default.NotificationsOff
+            ) {
+                viewModel.toggleMute(sender)
+                Toast.makeText(
+                    context,
+                    if (viewModel.isMuted(sender)) "Notifications muted" else "Notifications unmuted",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+            Spacer(modifier = Modifier.height(10.dp))
+            SenderActionButton("Report as spam", Icons.Default.Report, tint = spamColor()) {
+                viewModel.reportSpamSender(sender)
+                Toast.makeText(context, "Reported as spam", Toast.LENGTH_SHORT).show()
+                viewModel.closeSenderInfo()
+                viewModel.closeThread()
+            }
+            Spacer(modifier = Modifier.height(10.dp))
+            SenderActionButton("Block sender", Icons.Default.Block, tint = spamColor()) {
+                viewModel.blockConversation(sender)
+                viewModel.closeSenderInfo()
+                viewModel.closeThread()
+            }
+        }
+    }
+}
+
+@Composable
+private fun SenderStatusChip(label: String, icon: ImageVector, color: Color) {
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(color.copy(alpha = 0.14f))
+            .padding(horizontal = 11.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(5.dp)
+    ) {
+        Icon(icon, contentDescription = null, tint = color, modifier = Modifier.size(14.dp))
+        Text(label, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold, color = color)
+    }
+}
+
+@Composable
+private fun SenderInfoRow(label: String, value: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = label,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
+            modifier = Modifier.weight(1f)
+        )
+        Text(
+            text = value,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.ExtraBold,
+            color = MaterialTheme.colorScheme.onBackground
+        )
+    }
+}
+
+@Composable
+private fun SenderActionButton(
+    label: String,
+    icon: ImageVector,
+    tint: Color = MaterialTheme.colorScheme.primary,
+    onClick: () -> Unit
+) {
+    OutlinedButton(
+        onClick = onClick,
+        modifier = Modifier
+            .fillMaxWidth()
+            .testTag("sender_action_${label}"),
+        shape = RoundedCornerShape(14.dp),
+        border = BorderStroke(1.dp, tint.copy(alpha = 0.5f))
+    ) {
+        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(18.dp))
+        Spacer(modifier = Modifier.width(10.dp))
+        Text(label, fontWeight = FontWeight.Bold, color = tint)
     }
 }
 
@@ -2445,7 +2927,7 @@ private fun EntityChip(text: String) {
 }
 
 @Composable
-private fun CopyOtpChip(otp: String, msgId: Long) {
+internal fun CopyOtpChip(otp: String, msgId: Long) {
     val clipboardManager = LocalClipboardManager.current
     val context = LocalContext.current
     FilledTonalButton(
@@ -2490,150 +2972,6 @@ private fun SwipeAction(
         Icon(imageVector = icon, contentDescription = label, tint = content, modifier = Modifier.size(18.dp))
         Spacer(modifier = Modifier.height(5.dp))
         Text(label, fontSize = 9.5.sp, fontWeight = FontWeight.Bold, color = content)
-    }
-}
-
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun MessageCard(
-    msg: SMSMessage,
-    entityText: String?,
-    onOpen: () -> Unit,
-    onDelete: () -> Unit,
-    onBlock: () -> Unit
-) {
-    val categoryColor = categoryColor(msg.category)
-    val isUnread = !msg.isRead
-    val otp = remember(msg.body) { detectOtp(msg.body) }
-    val timeText = remember(msg.timestamp) {
-        SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date(msg.timestamp))
-    }
-
-    val density = LocalDensity.current
-    val revealPx = with(density) { 132.dp.toPx() }
-    val offsetX = remember(msg.id) { androidx.compose.animation.core.Animatable(0f) }
-    val scope = rememberCoroutineScope()
-
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(20.dp))
-    ) {
-        // Behind layer: Block + Delete revealed on swipe-left
-        Row(
-            modifier = Modifier.matchParentSize(),
-            horizontalArrangement = Arrangement.End
-        ) {
-            SwipeAction(
-                icon = Icons.Default.Block,
-                label = "Block",
-                container = MaterialTheme.colorScheme.primaryContainer,
-                content = MaterialTheme.colorScheme.onPrimaryContainer,
-                onClick = onBlock
-            )
-            SwipeAction(
-                icon = Icons.Default.Delete,
-                label = "Delete",
-                container = spamSoftColor(),
-                content = spamColor(),
-                onClick = onDelete
-            )
-        }
-
-        // Foreground card
-        Card(
-            onClick = {
-                if (offsetX.value != 0f) scope.launch { offsetX.animateTo(0f) } else onOpen()
-            },
-            modifier = Modifier
-                .fillMaxWidth()
-                .offset { androidx.compose.ui.unit.IntOffset(offsetX.value.roundToInt(), 0) }
-                .pointerInput(msg.id) {
-                    detectHorizontalDragGestures(
-                        onHorizontalDrag = { change, dragAmount ->
-                            change.consume()
-                            val next = (offsetX.value + dragAmount).coerceIn(-revealPx, 0f)
-                            scope.launch { offsetX.snapTo(next) }
-                        },
-                        onDragEnd = {
-                            val target = if (offsetX.value < -revealPx / 2f) -revealPx else 0f
-                            scope.launch { offsetX.animateTo(target) }
-                        }
-                    )
-                }
-                .testTag("message_card_${msg.id}"),
-            colors = CardDefaults.cardColors(
-                containerColor = if (msg.isBlocked)
-                                     MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
-                                         .compositeOver(MaterialTheme.colorScheme.surface)
-                                 else MaterialTheme.colorScheme.surface
-            ),
-            shape = RoundedCornerShape(20.dp),
-            border = if (isUnread) BorderStroke(2.dp, categoryColor)
-                     else BorderStroke(1.dp, categoryColor.copy(alpha = 0.45f))
-        ) {
-            Column(modifier = Modifier.padding(12.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    val senderName = displayNameFor(msg.sender)
-                    AvatarTile(
-                        label = senderName.take(1).uppercase(Locale.getDefault()),
-                        color = categoryColor
-                    )
-                    Spacer(modifier = Modifier.width(12.dp))
-                    if (isUnread) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .clip(CircleShape)
-                                .background(categoryColor)
-                        )
-                        Spacer(modifier = Modifier.width(7.dp))
-                    }
-                    Text(
-                        text = senderName,
-                        fontWeight = if (isUnread) FontWeight.ExtraBold else FontWeight.Medium,
-                        fontSize = 15.sp,
-                        color = MaterialTheme.colorScheme.onBackground.copy(
-                            alpha = if (isUnread) 1f else 0.65f
-                        ),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.weight(1f)
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    SimPill(msg.simId)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = timeText,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.SemiBold,
-                        color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f)
-                    )
-                }
-
-                Spacer(modifier = Modifier.height(8.dp))
-                Text(
-                    text = msg.body,
-                    fontSize = 13.sp,
-                    lineHeight = 19.5.sp,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.72f),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.fillMaxWidth()
-                )
-
-                if (entityText != null || otp != null) {
-                    Spacer(modifier = Modifier.height(8.dp))
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        if (entityText != null) EntityChip(entityText)
-                        if (otp != null) CopyOtpChip(otp, msg.id)
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -2708,7 +3046,8 @@ fun MessageDetailScreen(viewModel: SmsOrganizerViewModel, msg: SMSMessage) {
                 color = categoryColor,
                 size = 38.dp,
                 corner = 12.dp,
-                fontSize = 16.sp
+                fontSize = 16.sp,
+                photoUri = photoUriFor(msg.sender)
             )
             Spacer(modifier = Modifier.width(10.dp))
             Column(modifier = Modifier.weight(1f)) {
@@ -3017,6 +3356,7 @@ private fun MessageSmartCard(
 // ==========================================
 // SECURITY HELPERS FOR DEVICE LOCK
 // ==========================================
+@Suppress("DEPRECATION")
 fun triggerDeviceAuthentication(
     context: Context,
     launcher: ActivityResultLauncher<Intent>,
@@ -3227,7 +3567,7 @@ fun FinanceScreen(viewModel: SmsOrganizerViewModel) {
                     color = MaterialTheme.colorScheme.onPrimaryContainer,
                     modifier = Modifier.padding(vertical = 4.dp)
                 )
-                Divider(
+                HorizontalDivider(
                     color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.15f),
                     modifier = Modifier.padding(vertical = 12.dp)
                 )
@@ -3352,7 +3692,7 @@ fun TransactionRowItem(tx: FinanceTx, onClick: () -> Unit = {}) {
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 val iconColor = if (tx.isCredit) goodColor() else spamColor()
-                val icon = if (tx.isCredit) Icons.Default.TrendingUp else Icons.Default.TrendingDown
+                val icon = if (tx.isCredit) Icons.AutoMirrored.Filled.TrendingUp else Icons.AutoMirrored.Filled.TrendingDown
                 
                 Box(
                     modifier = Modifier
@@ -3515,6 +3855,42 @@ fun RemindersScreen(viewModel: SmsOrganizerViewModel) {
             }
         }
 
+        // Prompt to grant exact-alarm permission when alerts are on but the OS withholds them,
+        // otherwise due-alerts silently never fire.
+        val alertsOn by viewModel.reminderAlertsEnabled
+        if (alertsOn && !viewModel.canScheduleExactAlarms()) {
+            Spacer(modifier = Modifier.height(12.dp))
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.NotificationsActive,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onErrorContainer,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text(
+                        text = "Allow exact alarms so due-date alerts can fire.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer,
+                        modifier = Modifier.weight(1f)
+                    )
+                    TextButton(onClick = { context.startActivity(viewModel.buildExactAlarmSettingsIntent()) }) {
+                        Text("Allow", fontSize = 12.sp)
+                    }
+                }
+            }
+        }
+
         Spacer(modifier = Modifier.height(18.dp))
         Text(
             text = "Active Reminders",
@@ -3546,8 +3922,11 @@ fun RemindersScreen(viewModel: SmsOrganizerViewModel) {
                 items(reminders) { reminder ->
                     ReminderRowItem(
                         reminder = reminder,
+                        onOpen = { viewModel.openMessageById(reminder.messageId) },
                         onAddToCalendar = { viewModel.addEventToCalendar(context, reminder) },
-                        onDismiss = { viewModel.deleteReminder(reminder.id) }
+                        onDismiss = { viewModel.deleteReminder(reminder.id) },
+                        onToggleAlert = { enabled -> viewModel.setReminderAlert(reminder.id, enabled) },
+                        onRecurrenceChange = { rec -> viewModel.setReminderRecurrence(reminder.id, rec) }
                     )
                 }
             }
@@ -3556,14 +3935,24 @@ fun RemindersScreen(viewModel: SmsOrganizerViewModel) {
 }
 
 @Composable
-fun ReminderRowItem(reminder: ReminderSms, onAddToCalendar: () -> Unit, onDismiss: () -> Unit) {
+fun ReminderRowItem(
+    reminder: ReminderSms,
+    onOpen: () -> Unit,
+    onAddToCalendar: () -> Unit,
+    onDismiss: () -> Unit,
+    onToggleAlert: (Boolean) -> Unit,
+    onRecurrenceChange: (String) -> Unit
+) {
     val dateText = remember(reminder.dueDate) {
         val sdf = SimpleDateFormat("EEEE, dd MMMM yyyy", Locale.getDefault())
         sdf.format(Date(reminder.dueDate))
     }
+    var recurrenceMenuOpen by remember { mutableStateOf(false) }
 
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onOpen() },
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant),
         shape = RoundedCornerShape(16.dp)
@@ -3618,6 +4007,63 @@ fun ReminderRowItem(reminder: ReminderSms, onAddToCalendar: () -> Unit, onDismis
                 color = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.8f)
             )
 
+            Spacer(modifier = Modifier.height(10.dp))
+            // Per-reminder controls: in-app due-alert toggle + recurrence cadence.
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                AssistChip(
+                    onClick = { onToggleAlert(!reminder.alertEnabled) },
+                    label = { Text(if (reminder.alertEnabled) "Alert on" else "Alert off", fontSize = 11.sp) },
+                    leadingIcon = {
+                        Icon(
+                            imageVector = if (reminder.alertEnabled) Icons.Default.NotificationsActive else Icons.Default.NotificationsOff,
+                            contentDescription = "Toggle alert",
+                            modifier = Modifier.size(14.dp)
+                        )
+                    },
+                    colors = if (reminder.alertEnabled) {
+                        AssistChipDefaults.assistChipColors(
+                            containerColor = MaterialTheme.colorScheme.primaryContainer,
+                            labelColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                            leadingIconContentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                        )
+                    } else {
+                        AssistChipDefaults.assistChipColors()
+                    }
+                )
+
+                Box {
+                    AssistChip(
+                        onClick = { recurrenceMenuOpen = true },
+                        label = { Text(RecurrenceUtil.label(reminder.recurrence), fontSize = 11.sp) },
+                        leadingIcon = {
+                            Icon(
+                                imageVector = Icons.Default.Repeat,
+                                contentDescription = "Recurrence",
+                                modifier = Modifier.size(14.dp)
+                            )
+                        }
+                    )
+                    DropdownMenu(
+                        expanded = recurrenceMenuOpen,
+                        onDismissRequest = { recurrenceMenuOpen = false }
+                    ) {
+                        RecurrenceUtil.ALL.forEach { rec ->
+                            DropdownMenuItem(
+                                text = { Text(RecurrenceUtil.label(rec)) },
+                                onClick = {
+                                    recurrenceMenuOpen = false
+                                    if (rec != reminder.recurrence) onRecurrenceChange(rec)
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+
             Spacer(modifier = Modifier.height(12.dp))
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -3648,10 +4094,16 @@ fun ReminderRowItem(reminder: ReminderSms, onAddToCalendar: () -> Unit, onDismis
 // ==========================================
 // SCREEN: PEER TO PEER SYNC SECTION
 // ==========================================
+// Groups the raw pairing code into hyphen-separated blocks for readable display/transcription.
+private fun formatPairingCode(raw: String): String =
+    raw.chunked(P2PSyncEngine.PAIRING_CODE_GROUP).joinToString("-")
+
 @Composable
 fun SyncScreen(viewModel: SmsOrganizerViewModel) {
     val syncState by viewModel.syncState.collectAsState()
-    
+    val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
+
     var showHostPanel by remember { mutableStateOf(false) }
     var showJoinPanel by remember { mutableStateOf(false) }
 
@@ -3726,7 +4178,24 @@ fun SyncScreen(viewModel: SmsOrganizerViewModel) {
                             Column(modifier = Modifier.padding(12.dp)) {
                                 Text("Ip Address: ${state.ipAddress}", fontSize = 13.sp)
                                 Text("Port Node: ${state.port}", fontSize = 13.sp)
-                                Text("Exchange PIN: ${state.pin}", fontSize = 13.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text("Pairing code", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text(
+                                        formatPairingCode(state.code),
+                                        fontSize = 13.sp,
+                                        fontFamily = FontFamily.Monospace,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                    IconButton(onClick = {
+                                        clipboardManager.setText(AnnotatedString(formatPairingCode(state.code)))
+                                        Toast.makeText(context, "Pairing code copied", Toast.LENGTH_SHORT).show()
+                                    }) {
+                                        Icon(Icons.Default.ContentCopy, contentDescription = "Copy pairing code", modifier = Modifier.size(18.dp))
+                                    }
+                                }
                             }
                         }
                         Button(
@@ -3779,7 +4248,7 @@ fun SyncScreen(viewModel: SmsOrganizerViewModel) {
                     onClick = {
                         showHostPanel = true
                         showJoinPanel = false
-                        pinValue = String.format("%04d", Random().nextInt(10000))
+                        pinValue = viewModel.generatePairingCode()
                     },
                     modifier = Modifier
                         .weight(1f)
@@ -3830,9 +4299,26 @@ fun SyncScreen(viewModel: SmsOrganizerViewModel) {
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Secure Peer PIN: ", fontSize = 13.sp)
-                        Text(pinValue, fontWeight = FontWeight.Bold, fontSize = 18.sp, color = MaterialTheme.colorScheme.primary)
+                        Text("One-time pairing code", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                        IconButton(onClick = {
+                            clipboardManager.setText(AnnotatedString(formatPairingCode(pinValue)))
+                            Toast.makeText(context, "Pairing code copied", Toast.LENGTH_SHORT).show()
+                        }) {
+                            Icon(Icons.Default.ContentCopy, contentDescription = "Copy pairing code", modifier = Modifier.size(18.dp))
+                        }
                     }
+                    Text(
+                        formatPairingCode(pinValue),
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 15.sp,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                    Text(
+                        "Enter this exact code on the peer device. It is generated fresh for this session and never sent over the network.",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
 
                     Button(
                         onClick = {
@@ -3871,10 +4357,12 @@ fun SyncScreen(viewModel: SmsOrganizerViewModel) {
                     OutlinedTextField(
                         value = pinValue,
                         onValueChange = { pinValue = it },
-                        label = { Text("Pairing Security PIN") },
-                        placeholder = { Text("e.g. 1290") },
+                        label = { Text("Pairing code from host") },
+                        placeholder = { Text("e.g. K7M2P9QR-3T6VWX4Y-…") },
+                        textStyle = LocalTextStyle.current.copy(fontFamily = FontFamily.Monospace),
                         modifier = Modifier.fillMaxWidth(),
-                        singleLine = true
+                        singleLine = false,
+                        maxLines = 3
                     )
 
                     Button(
@@ -3900,7 +4388,7 @@ fun SyncScreen(viewModel: SmsOrganizerViewModel) {
 // ==========================================
 @Composable
 fun SettingsScreen(viewModel: SmsOrganizerViewModel, onOpenImport: () -> Unit) {
-    // null = main page, "advanced" = grouped admin sections, "about" = About screen.
+    // null = main page; other keys open dedicated sub-pages (same nav pattern throughout).
     var subPage by rememberSaveable { mutableStateOf<String?>(null) }
 
     if (subPage != null) {
@@ -3908,15 +4396,35 @@ fun SettingsScreen(viewModel: SmsOrganizerViewModel, onOpenImport: () -> Unit) {
     }
 
     when (subPage) {
+        "theme" -> ThemeSettingsPage(
+            viewModel = viewModel,
+            onBack = { subPage = null }
+        )
+        "integration" -> IntegrationSettingsPage(
+            viewModel = viewModel,
+            onBack = { subPage = null }
+        )
+        "permissions" -> PermissionsSettingsPage(
+            viewModel = viewModel,
+            onBack = { subPage = null }
+        )
         "advanced" -> AdvancedSettingsPage(
             viewModel = viewModel,
             onOpenImport = onOpenImport,
             onBack = { subPage = null }
         )
+        "testing" -> TestingSandboxPage(
+            viewModel = viewModel,
+            onBack = { subPage = null }
+        )
         "about" -> AboutPage(onBack = { subPage = null })
         else -> SettingsMainPage(
             viewModel = viewModel,
+            onOpenTheme = { subPage = "theme" },
+            onOpenIntegration = { subPage = "integration" },
+            onOpenPermissions = { subPage = "permissions" },
             onOpenAdvanced = { subPage = "advanced" },
+            onOpenTesting = { subPage = "testing" },
             onOpenAbout = { subPage = "about" }
         )
     }
@@ -3935,9 +4443,108 @@ private data class SchemeMeta(
 @Composable
 private fun SettingsMainPage(
     viewModel: SmsOrganizerViewModel,
+    onOpenTheme: () -> Unit,
+    onOpenIntegration: () -> Unit,
+    onOpenPermissions: () -> Unit,
     onOpenAdvanced: () -> Unit,
+    onOpenTesting: () -> Unit,
     onOpenAbout: () -> Unit
 ) {
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        // Hero
+        item {
+            Column(modifier = Modifier.padding(top = 10.dp, bottom = 2.dp)) {
+                Text(
+                    "PREFERENCES",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    letterSpacing = 0.08.em
+                )
+                Text(
+                    "Settings",
+                    fontSize = 30.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = MaterialTheme.colorScheme.onBackground
+                )
+            }
+        }
+
+        // ---- Navigation rows ----
+        item {
+            SettingsNavRow(
+                icon = Icons.Default.Palette,
+                title = "Appearance & theme",
+                subtitle = "Color scheme & light/dark mode",
+                onClick = onOpenTheme
+            )
+        }
+        item {
+            SettingsNavRow(
+                icon = Icons.Default.Extension,
+                title = "System integration",
+                subtitle = "Default SMS app & permissions",
+                onClick = onOpenIntegration
+            )
+        }
+        item {
+            SettingsNavRow(
+                icon = Icons.Default.Lock,
+                title = "Permissions",
+                subtitle = "What SMS Sentry can access & why",
+                onClick = onOpenPermissions
+            )
+        }
+        item {
+            SettingsNavRow(
+                icon = Icons.Default.Tune,
+                title = "Advanced settings",
+                subtitle = "Security, SIM, filters & backup",
+                onClick = onOpenAdvanced
+            )
+        }
+        item {
+            SettingsNavRow(
+                icon = Icons.Default.Science,
+                title = "Testing",
+                subtitle = "SMS Sentry sandbox simulator",
+                onClick = onOpenTesting
+            )
+        }
+        item {
+            SettingsNavRow(
+                icon = Icons.Default.Info,
+                title = "About",
+                subtitle = "Author, build & tooling info",
+                onClick = onOpenAbout
+            )
+        }
+
+        // ---- Footer ----
+        item {
+            Text(
+                text = "SMS Sentry · v${BuildConfig.VERSION_NAME} · Offline build",
+                fontSize = 10.5.sp,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
+            )
+        }
+        item { Spacer(modifier = Modifier.height(40.dp)) }
+    }
+}
+
+// ------------------------------------------------------------------
+// Appearance & theme sub-page: color scheme + light/dark mode
+// ------------------------------------------------------------------
+@Composable
+private fun ThemeSettingsPage(viewModel: SmsOrganizerViewModel, onBack: () -> Unit) {
     var appTheme by viewModel.selectedTheme
     var forceDark by viewModel.isDarkTheme
     var systemTheme by viewModel.isSystemTheme
@@ -3973,27 +4580,7 @@ private fun SettingsMainPage(
             .padding(horizontal = 16.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        // Hero
-        item {
-            Column(modifier = Modifier.padding(top = 10.dp, bottom = 2.dp)) {
-                Text(
-                    "PREFERENCES",
-                    style = MaterialTheme.typography.labelSmall,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    letterSpacing = 0.08.em
-                )
-                Text(
-                    "Settings",
-                    fontSize = 30.sp,
-                    fontWeight = FontWeight.ExtraBold,
-                    color = MaterialTheme.colorScheme.onBackground
-                )
-            }
-        }
-
-        // ---- Aesthetics & theme ----
-        item { SettingsSectionHeader(Icons.Default.Palette, "Aesthetics & theme") }
+        item { SubPageHeader("Appearance & theme", onBack) }
 
         item {
             Card(
@@ -4088,63 +4675,313 @@ private fun SettingsMainPage(
             }
         }
 
-        // ---- System integration ----
-        item { SettingsSectionHeader(Icons.Default.Extension, "System integration") }
+        item { Spacer(modifier = Modifier.height(40.dp)) }
+    }
+}
+
+// ------------------------------------------------------------------
+// System integration sub-page: default SMS app + permissions
+// ------------------------------------------------------------------
+@Composable
+private fun IntegrationSettingsPage(viewModel: SmsOrganizerViewModel, onBack: () -> Unit) {
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        item { SubPageHeader("System integration", onBack) }
         item { DefaultSmsAppCard(viewModel) }
         item { SystemIntegrationCard() }
+        item { Spacer(modifier = Modifier.height(40.dp)) }
+    }
+}
 
-        // ---- Navigation rows ----
-        item {
-            SettingsNavRow(
-                icon = Icons.Default.Tune,
-                title = "Advanced settings",
-                subtitle = "Security, SIM, filters & backup",
-                onClick = onOpenAdvanced
-            )
-        }
-        item {
-            SettingsNavRow(
-                icon = Icons.Default.Info,
-                title = "About",
-                subtitle = "Author, build & tooling info",
-                onClick = onOpenAbout
-            )
-        }
+// ------------------------------------------------------------------
+// Permissions sub-page: full inventory of what the app accesses & why
+// ------------------------------------------------------------------
 
-        // ---- Footer ----
+/** A dangerous (runtime-prompted) permission the app requests explicitly. */
+private data class RuntimePermissionInfo(
+    val permission: String,
+    val label: String,
+    val reason: String,
+    /** Only requested/relevant at or above this SDK; below it is implicitly granted or absent. */
+    val minSdk: Int = 0
+)
+
+private val RUNTIME_PERMISSIONS = listOf(
+    RuntimePermissionInfo(android.Manifest.permission.RECEIVE_SMS, "Receive SMS", "Receive incoming text messages as they arrive."),
+    RuntimePermissionInfo(android.Manifest.permission.READ_SMS, "Read SMS", "Read existing messages on your phone to organize them."),
+    RuntimePermissionInfo(android.Manifest.permission.SEND_SMS, "Send SMS", "Send replies and scheduled messages."),
+    RuntimePermissionInfo(android.Manifest.permission.RECEIVE_MMS, "Receive MMS", "Receive picture / group (MMS) messages."),
+    RuntimePermissionInfo(android.Manifest.permission.RECEIVE_WAP_PUSH, "Receive WAP push", "Detect incoming MMS notifications from the carrier."),
+    RuntimePermissionInfo(android.Manifest.permission.READ_CONTACTS, "Read contacts", "Show sender names instead of raw numbers."),
+    RuntimePermissionInfo(android.Manifest.permission.READ_PHONE_STATE, "Phone state", "Detect active SIMs for correct dual-SIM sending."),
+    RuntimePermissionInfo(
+        android.Manifest.permission.POST_NOTIFICATIONS,
+        "Notifications",
+        "Show new-message, OTP and reminder notifications.",
+        minSdk = android.os.Build.VERSION_CODES.TIRAMISU
+    )
+)
+
+/** A normal permission Android grants automatically at install (no runtime prompt). */
+private data class ImplicitPermissionInfo(val label: String, val reason: String)
+
+private val IMPLICIT_PERMISSIONS = listOf(
+    ImplicitPermissionInfo("Internet", "Local peer-to-peer sync over Wi-Fi (no data leaves your network)."),
+    ImplicitPermissionInfo("Network state", "Check connectivity for peer-to-peer sync."),
+    ImplicitPermissionInfo("Wi-Fi state", "Discover peers on the same Wi-Fi network."),
+    ImplicitPermissionInfo("Change Wi-Fi state", "Establish the local sync connection."),
+    ImplicitPermissionInfo("Run after reboot", "Re-arm scheduled messages and reminders after a reboot.")
+)
+
+@Composable
+private fun PermissionsSettingsPage(viewModel: SmsOrganizerViewModel, onBack: () -> Unit) {
+    val context = LocalContext.current
+
+    fun isGranted(p: String): Boolean =
+        androidx.core.content.ContextCompat.checkSelfPermission(context, p) ==
+            android.content.pm.PackageManager.PERMISSION_GRANTED
+
+    // Bumped to force a recompute of grant state after the prompt returns or on resume.
+    var grantTick by remember { mutableStateOf(0) }
+    val applicable = remember {
+        RUNTIME_PERMISSIONS.filter { android.os.Build.VERSION.SDK_INT >= it.minSdk }
+    }
+    val grants = remember(grantTick) { applicable.associate { it.permission to isGranted(it.permission) } }
+    val exactAlarmOk = remember(grantTick) { viewModel.canScheduleExactAlarms() }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { _ -> grantTick++ }
+
+    // Refresh pills when returning from the system settings / app-info screen.
+    val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) grantTick++
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        item { SubPageHeader("Permissions", onBack) }
         item {
             Text(
-                text = "SMS Sentry · v${BuildConfig.VERSION_NAME} · Offline build",
-                fontSize = 10.5.sp,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
+                text = "Everything SMS Sentry can access, and exactly why. The app works fully offline — " +
+                       "network access is only for optional peer-to-peer sync on your own Wi-Fi.",
+                fontSize = 12.sp,
+                lineHeight = 16.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
+
+        // ---- Requested at runtime (dangerous) ----
+        item {
+            PermissionSectionHeader(
+                "REQUESTED AT RUNTIME",
+                "You're asked to allow these — you can change them anytime."
+            )
+        }
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth().testTag("permissions_runtime_card"),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant),
+                shape = RoundedCornerShape(20.dp)
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+                    applicable.forEachIndexed { i, info ->
+                        PermissionRow(
+                            granted = grants[info.permission] == true,
+                            label = info.label,
+                            reason = info.reason,
+                            statusOn = "Allowed",
+                            statusOff = "Not allowed",
+                            showDivider = i < applicable.lastIndex
+                        )
+                    }
+                }
+            }
+        }
+        item {
+            val anyDenied = applicable.any { grants[it.permission] != true }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (anyDenied) {
+                    Button(
+                        onClick = { permissionLauncher.launch(applicable.map { it.permission }.toTypedArray()) },
+                        modifier = Modifier.weight(1.5f),
+                        contentPadding = PaddingValues(horizontal = 8.dp)
+                    ) {
+                        Text("Grant permissions", fontSize = 12.sp)
+                    }
+                }
+                OutlinedButton(
+                    onClick = {
+                        val intent = Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                            data = android.net.Uri.fromParts("package", context.packageName, null)
+                        }
+                        context.startActivity(intent)
+                    },
+                    modifier = Modifier.weight(1f),
+                    contentPadding = PaddingValues(horizontal = 8.dp)
+                ) {
+                    Icon(imageVector = Icons.Default.Info, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Open app info", fontSize = 12.sp)
+                }
+            }
+        }
+
+        // ---- Special access ----
+        item {
+            PermissionSectionHeader(
+                "SPECIAL ACCESS",
+                "Granted from system settings rather than a normal prompt."
+            )
+        }
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant),
+                shape = RoundedCornerShape(20.dp)
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+                    PermissionRow(
+                        granted = exactAlarmOk,
+                        label = "Alarms & reminders",
+                        reason = "Deliver scheduled SMS and reminders at the exact time.",
+                        statusOn = "Allowed",
+                        statusOff = "Not allowed",
+                        showDivider = false
+                    )
+                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S && !exactAlarmOk) {
+                        OutlinedButton(
+                            onClick = { context.startActivity(viewModel.buildExactAlarmSettingsIntent()) },
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 14.dp)
+                        ) {
+                            Text("Open settings", fontSize = 12.sp)
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- Granted automatically (normal) ----
+        item {
+            PermissionSectionHeader(
+                "GRANTED AUTOMATICALLY",
+                "Standard permissions Android grants at install — no prompt, and they can't be revoked individually."
+            )
+        }
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant),
+                shape = RoundedCornerShape(20.dp)
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 16.dp)) {
+                    IMPLICIT_PERMISSIONS.forEachIndexed { i, info ->
+                        PermissionRow(
+                            granted = true,
+                            label = info.label,
+                            reason = info.reason,
+                            statusOn = "Auto",
+                            statusOff = "Auto",
+                            showDivider = i < IMPLICIT_PERMISSIONS.lastIndex
+                        )
+                    }
+                }
+            }
+        }
+
         item { Spacer(modifier = Modifier.height(40.dp)) }
     }
 }
 
 @Composable
-private fun SettingsSectionHeader(icon: ImageVector, title: String) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp),
-        modifier = Modifier.padding(start = 2.dp, top = 2.dp)
-    ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.primary,
-            modifier = Modifier.size(18.dp)
-        )
+private fun PermissionSectionHeader(title: String, subtitle: String?) {
+    Column(modifier = Modifier.padding(top = 4.dp)) {
         Text(
-            title,
-            fontWeight = FontWeight.ExtraBold,
-            fontSize = 15.sp,
-            color = MaterialTheme.colorScheme.onBackground
+            text = title,
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Bold,
+            letterSpacing = 0.08.em,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
         )
+        if (subtitle != null) {
+            Text(
+                text = subtitle,
+                fontSize = 11.sp,
+                lineHeight = 14.sp,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+private fun PermissionRow(
+    granted: Boolean,
+    label: String,
+    reason: String,
+    statusOn: String,
+    statusOff: String,
+    showDivider: Boolean
+) {
+    val good = goodColor()
+    val goodSoft = goodSoftColor()
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 11.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(30.dp)
+                .clip(CircleShape)
+                .background(if (granted) goodSoft else MaterialTheme.colorScheme.errorContainer),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = if (granted) Icons.Default.Check else Icons.Default.Warning,
+                contentDescription = null,
+                tint = if (granted) good else MaterialTheme.colorScheme.error,
+                modifier = Modifier.size(16.dp)
+            )
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(label, fontSize = 13.5.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
+            Text(reason, fontSize = 11.5.sp, lineHeight = 15.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Spacer(modifier = Modifier.width(8.dp))
+        val pillText = if (granted) statusOn else statusOff
+        val pillFg = if (granted) good else MaterialTheme.colorScheme.error
+        val pillBg = if (granted) goodSoft else MaterialTheme.colorScheme.errorContainer
+        Box(
+            modifier = Modifier
+                .clip(RoundedCornerShape(999.dp))
+                .background(pillBg)
+                .padding(horizontal = 9.dp, vertical = 4.dp)
+        ) {
+            Text(pillText, fontSize = 10.sp, fontWeight = FontWeight.ExtraBold, color = pillFg)
+        }
+    }
+    if (showDivider) {
+        HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
     }
 }
 
@@ -4321,7 +5158,7 @@ private fun SubPageHeader(title: String, onBack: () -> Unit) {
     ) {
         IconButton(onClick = onBack) {
             Icon(
-                imageVector = Icons.Default.ArrowBack,
+                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                 contentDescription = "Back",
                 tint = MaterialTheme.colorScheme.onBackground
             )
@@ -4588,7 +5425,7 @@ private fun IntegrationStatusRow(
         }
     }
     if (showDivider) {
-        Divider(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
+        HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
     }
 }
 
@@ -4609,6 +5446,8 @@ private fun AdvancedSettingsPage(
     var ruleCategory by remember { mutableStateOf("Spam") }
     var ruleTypeSelection by remember { mutableStateOf("KEYWORD") }
     var defaultSimChoice by viewModel.defaultSmsSim
+    val activeSims by viewModel.activeSims.collectAsState()
+    var autoMarkReadDelay by viewModel.autoMarkReadDelaySeconds
 
     LazyColumn(
         modifier = Modifier
@@ -4658,7 +5497,7 @@ private fun AdvancedSettingsPage(
                     }
 
                     if (viewModel.isFinanceLocked.value) {
-                        Divider(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                        HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.SpaceBetween,
@@ -4700,9 +5539,48 @@ private fun AdvancedSettingsPage(
             }
         }
 
-        // --- Multi-SIM Preferences ---
+        // --- Multi-SIM Preferences --- (only on dual-SIM devices with READ_PHONE_STATE granted)
+        if (activeSims.size > 1) {
+            item {
+                Text("Multi-SIM Preferences", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+            }
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Text("CHOOSE DEFAULT OUTGOING SIM", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+
+                        // Option value stays "SIM <slot>" for persistence; the carrier name is the label.
+                        val simLabels = activeSims.associate { "SIM ${it.slot}" to it.displayLabel }
+                        val simOptions = activeSims.map { "SIM ${it.slot}" } + "Ask Every Time"
+                        simOptions.forEach { opt ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { defaultSimChoice = opt }
+                                    .padding(vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Text(text = simLabels[opt] ?: opt, style = MaterialTheme.typography.bodyMedium)
+                                RadioButton(
+                                    selected = defaultSimChoice == opt,
+                                    onClick = { defaultSimChoice = opt }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Reading ---
         item {
-            Text("Multi-SIM Preferences", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+            Text("Reading", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
         }
         item {
             Card(
@@ -4712,23 +5590,80 @@ private fun AdvancedSettingsPage(
                 shape = RoundedCornerShape(16.dp)
             ) {
                 Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    Text("CHOOSE DEFAULT OUTGOING SIM", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                    Text("AUTO-MARK CONVERSATIONS READ", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                    Text(
+                        "When you open a conversation, its messages are marked read after this delay.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
+                    )
 
-                    val simOptions = listOf("SIM 1", "SIM 2", "Ask Every Time")
-                    simOptions.forEach { opt ->
+                    // label -> seconds (0 = Off)
+                    val delayOptions = listOf(
+                        "Off" to 0,
+                        "2 seconds" to 2,
+                        "3 seconds" to 3,
+                        "5 seconds" to 5,
+                        "10 seconds" to 10,
+                        "15 seconds" to 15
+                    )
+                    delayOptions.forEach { (label, secs) ->
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clickable { defaultSimChoice = opt }
+                                .clickable { autoMarkReadDelay = secs }
                                 .padding(vertical = 8.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.SpaceBetween
                         ) {
-                            Text(text = opt, style = MaterialTheme.typography.bodyMedium)
+                            Text(text = label, style = MaterialTheme.typography.bodyMedium)
                             RadioButton(
-                                selected = defaultSimChoice == opt,
-                                onClick = { defaultSimChoice = opt }
+                                selected = autoMarkReadDelay == secs,
+                                onClick = { autoMarkReadDelay = secs }
                             )
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Reminders ---
+        item {
+            Text("Reminders", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+        }
+        item {
+            var reminderAlertsOn by viewModel.reminderAlertsEnabled
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant),
+                shape = RoundedCornerShape(16.dp)
+            ) {
+                Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("DUE-DATE ALERTS", style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                            Text("Reminder due alerts", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                            Text(
+                                "Notify you in-app at 9:00 AM on a reminder's due date. Each reminder can be silenced or set to repeat individually.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
+                            )
+                        }
+                        Switch(
+                            checked = reminderAlertsOn,
+                            onCheckedChange = { reminderAlertsOn = it }
+                        )
+                    }
+                    if (reminderAlertsOn && !viewModel.canScheduleExactAlarms()) {
+                        TextButton(
+                            onClick = { context.startActivity(viewModel.buildExactAlarmSettingsIntent()) },
+                            contentPadding = PaddingValues(0.dp)
+                        ) {
+                            Text("Allow exact alarms", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                         }
                     }
                 }
@@ -5082,7 +6017,7 @@ private fun AboutRow(icon: ImageVector, label: String, value: String, showDivide
         }
     }
     if (showDivider) {
-        Divider(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
+        HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
     }
 }
 
@@ -5098,11 +6033,28 @@ fun ComposeSmsDialog(
     initialBody: String = ""
 ) {
     val context = LocalContext.current
-    var senderInput by remember { mutableStateOf(initialRecipient) }
-    var smsBodyInput by remember { mutableStateOf(initialBody) }
-    
+    // Restore the saved compose draft only when opened blank; otherwise honor the explicit prefill.
+    val restoreDraft = initialRecipient.isBlank() && initialBody.isBlank()
+    val composeDraft = remember { if (restoreDraft) viewModel.composeDraft() else "" to "" }
+    var senderInput by remember { mutableStateOf(if (restoreDraft) composeDraft.first else initialRecipient) }
+    var smsBodyInput by remember { mutableStateOf(if (restoreDraft) composeDraft.second else initialBody) }
+    // Persist the unsent recipient/body when the composer closes without sending/scheduling.
+    var handledExit by remember { mutableStateOf(false) }
+    DisposableEffect(Unit) {
+        onDispose {
+            if (!handledExit) viewModel.saveComposeDraft(senderInput.trim(), smsBodyInput.trim())
+        }
+    }
+
     val currentDefaultSim by viewModel.defaultSmsSim
+    val activeSims by viewModel.activeSims.collectAsState()
     var selectedSimId by remember { mutableStateOf(if (currentDefaultSim == "SIM 2") 2 else 1) }
+    // Keep the chosen slot valid for the SIMs actually present (avoids sending on a missing slot).
+    LaunchedEffect(activeSims) {
+        if (activeSims.isNotEmpty() && activeSims.none { it.slot == selectedSimId }) {
+            selectedSimId = activeSims.first().slot
+        }
+    }
 
     // --- Scheduled delivery state ---
     val scheduledMessages by viewModel.scheduledMessages.collectAsState()
@@ -5117,7 +6069,21 @@ fun ComposeSmsDialog(
     val suggestedSenders = remember(inboxMessages) {
         inboxMessages.map { it.sender }.distinct().filter { it.isNotBlank() }.take(5)
     }
-    var showContactListDialog by remember { mutableStateOf(false) }
+
+    // Fold into an existing conversation the moment the recipient resolves to one (typed full
+    // number or tapped suggestion). Exact-match only, so a partial prefix never jumps mid-typing.
+    val allMessagesForMatch by viewModel.allMessages.collectAsState()
+    LaunchedEffect(senderInput, allMessagesForMatch) {
+        val match = viewModel.existingThreadFor(senderInput.trim()) ?: return@LaunchedEffect
+        // Carry the typed body over as the thread's reply draft (don't clobber an existing draft
+        // with a blank composer).
+        val body = smsBodyInput.trim()
+        if (body.isNotEmpty()) viewModel.saveDraft(match, body)
+        handledExit = true
+        viewModel.clearComposeDraft()
+        viewModel.openThread(match)
+        onDismiss()
+    }
 
     // Launcher for selecting a contact
     val contactPickerLauncher = rememberLauncherForActivityResult(
@@ -5185,162 +6151,6 @@ fun ComposeSmsDialog(
         }
     }
 
-    // Virtual Preset Contacts Dialog for Sandboxed Simulator
-    if (showContactListDialog) {
-        Dialog(onDismissRequest = { showContactListDialog = false }) {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(16.dp),
-                shape = RoundedCornerShape(24.dp),
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF1E2130))
-            ) {
-                Column(
-                    modifier = Modifier
-                        .padding(20.dp)
-                        .fillMaxWidth(),
-                    verticalArrangement = Arrangement.spacedBy(16.dp)
-                ) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            text = "Select Recipient",
-                            color = Color.White,
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold
-                        )
-                        IconButton(onClick = { showContactListDialog = false }) {
-                            Icon(
-                                imageVector = Icons.Default.Close,
-                                contentDescription = "Close",
-                                tint = Color(0xFF8C92AC)
-                            )
-                        }
-                    }
-
-                    Text(
-                        text = "Because sandbox emulators do not have a preconfigured contacts database, we have populated virtual simulation contacts below for high-fidelity interactive testing.",
-                        color = Color(0xFF8C92AC),
-                        style = MaterialTheme.typography.bodySmall
-                    )
-
-                    HorizontalDivider(color = Color(0xFF2C2F3D))
-
-                    Text(
-                        text = "VIRTUAL CONTACT LISTS",
-                        color = Color(0xFF4C8DF6),
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.Bold
-                    )
-
-                    val virtualContacts = listOf(
-                        Triple("Mom", "+91 94440 12345", Color(0xFF6F53A4)),
-                        Triple("Dad", "+91 98855 67890", Color(0xFF386B52)),
-                        Triple("Alex Smith", "+1 (555) 019-2834", Color(0xFF2B5EA0)),
-                        Triple("Office Workspace", "+1 (555) 014-4900", Color(0xFF006874)),
-                        Triple("HDFC Banking Alerts", "HDFC-TXN", Color(0xFFD32F2F)),
-                        Triple("SBI Mobile Finance", "SBI-ALRT", Color(0xFF0061A4)),
-                        Triple("Amazon Post Services", "AM-AMZN", Color(0xFFF57C00)),
-                        Triple("Google verification", "Google-OTP", Color(0xFF32536A))
-                    )
-
-                    LazyColumn(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .heightIn(max = 240.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        items(virtualContacts) { contact ->
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(12.dp))
-                                    .clickable {
-                                        senderInput = contact.second
-                                        showContactListDialog = false
-                                        Toast.makeText(context, "Selected ${contact.first}", Toast.LENGTH_SHORT).show()
-                                    }
-                                    .background(Color(0xFF141622))
-                                    .padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Box(
-                                    modifier = Modifier
-                                        .size(32.dp)
-                                        .background(contact.third, CircleShape),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text(
-                                        text = contact.first.firstOrNull()?.uppercase() ?: "#",
-                                        color = Color.White,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-                                Spacer(modifier = Modifier.width(12.dp))
-                                Column {
-                                    Text(
-                                        text = contact.first,
-                                        color = Color.White,
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.Medium
-                                    )
-                                    Text(
-                                        text = contact.second,
-                                        color = Color(0xFF8C92AC),
-                                        style = MaterialTheme.typography.bodySmall
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    HorizontalDivider(color = Color(0xFF2C2F3D))
-
-                    Button(
-                        onClick = {
-                            showContactListDialog = false
-                            val hasPermission = androidx.core.content.ContextCompat.checkSelfPermission(
-                                context,
-                                android.Manifest.permission.READ_CONTACTS
-                            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-                            
-                            if (hasPermission) {
-                                try {
-                                    contactPickerLauncher.launch(null)
-                                } catch (e: Exception) {
-                                    Toast.makeText(context, "Error opening phonebook: ${e.message}", Toast.LENGTH_SHORT).show()
-                                }
-                            } else {
-                                permissionsLauncher.launch(android.Manifest.permission.READ_CONTACTS)
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonColors(
-                            containerColor = Color(0xFF2C2F3D),
-                            contentColor = Color.White,
-                            disabledContainerColor = Color(0xFF20222D),
-                            disabledContentColor = Color(0xFF8C92AC)
-                        ),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Contacts,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp),
-                            tint = Color(0xFF4C8DF6)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("Search System Contacts App")
-                    }
-                }
-            }
-        }
-    }
-
     // --- Scheduled delivery: date picker (step 1) ---
     if (showScheduleDatePicker) {
         val dateState = rememberDatePickerState(initialSelectedDateMillis = System.currentTimeMillis())
@@ -5398,6 +6208,8 @@ fun ComposeSmsDialog(
                     if (viewModel.scheduleSms(recipient, body, selectedSimId, triggerAt)) {
                         val when_ = SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault()).format(Date(triggerAt))
                         Toast.makeText(context, "Scheduled for $when_", Toast.LENGTH_SHORT).show()
+                        handledExit = true
+                        viewModel.clearComposeDraft()
                         onDismiss()
                     }
                 }) { Text("Schedule") }
@@ -5505,7 +6317,7 @@ fun ComposeSmsDialog(
                 ) {
                     IconButton(onClick = onDismiss) {
                         Icon(
-                            imageVector = Icons.Default.ArrowBack,
+                            imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "Back",
                             tint = Color.White
                         )
@@ -5556,7 +6368,22 @@ fun ComposeSmsDialog(
                     }
                     
                     IconButton(
-                        onClick = { showContactListDialog = true },
+                        onClick = {
+                            val hasPermission = androidx.core.content.ContextCompat.checkSelfPermission(
+                                context,
+                                android.Manifest.permission.READ_CONTACTS
+                            ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+
+                            if (hasPermission) {
+                                try {
+                                    contactPickerLauncher.launch(null)
+                                } catch (e: Exception) {
+                                    Toast.makeText(context, "Error opening phonebook: ${e.message}", Toast.LENGTH_SHORT).show()
+                                }
+                            } else {
+                                permissionsLauncher.launch(android.Manifest.permission.READ_CONTACTS)
+                            }
+                        },
                         modifier = Modifier
                             .size(36.dp)
                             .testTag("composer_contacts_picker_button")
@@ -5792,28 +6619,42 @@ fun ComposeSmsDialog(
                                     }
                                 }
 
-                                // SIM Card Slot Badge (Clickable to swipe SIM 1 <> SIM 2)
-                                Box(
-                                    modifier = Modifier
-                                        .border(
-                                            width = 1.dp,
+                                // Always-on character count (adds segment info once the body splits).
+                                Text(
+                                    text = SmsSegment.composerLabel(smsBodyInput),
+                                    color = Color(0xFF8C92AC),
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+
+                                // SIM picker — only on multi-SIM devices; cycles through the active
+                                // subscriptions so the send routes to the chosen slot.
+                                if (activeSims.size > 1) {
+                                    val selectedSim = activeSims.firstOrNull { it.slot == selectedSimId } ?: activeSims.first()
+                                    Box(
+                                        modifier = Modifier
+                                            .border(
+                                                width = 1.dp,
+                                                color = Color(0xFF8C92AC),
+                                                shape = RoundedCornerShape(6.dp)
+                                            )
+                                            .clip(RoundedCornerShape(6.dp))
+                                            .clickable {
+                                                val idx = activeSims.indexOfFirst { it.slot == selectedSim.slot }
+                                                val next = activeSims[(idx + 1) % activeSims.size]
+                                                selectedSimId = next.slot
+                                                Toast.makeText(context, "Sending via ${next.displayLabel}", Toast.LENGTH_SHORT).show()
+                                            }
+                                            .padding(horizontal = 8.dp, vertical = 2.dp),
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Text(
+                                            text = "SIM ${selectedSim.slot}",
                                             color = Color(0xFF8C92AC),
-                                            shape = RoundedCornerShape(6.dp)
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold
                                         )
-                                        .clip(RoundedCornerShape(6.dp))
-                                        .clickable {
-                                            selectedSimId = if (selectedSimId == 1) 2 else 1
-                                            Toast.makeText(context, "Selected carrier SIM Slot $selectedSimId", Toast.LENGTH_SHORT).show()
-                                        }
-                                        .padding(horizontal = 8.dp, vertical = 2.dp),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text(
-                                        text = selectedSimId.toString(),
-                                        color = Color(0xFF8C92AC),
-                                        fontSize = 11.sp,
-                                        fontWeight = FontWeight.Bold
-                                    )
+                                    }
                                 }
                             }
 
@@ -5826,6 +6667,8 @@ fun ComposeSmsDialog(
                                 onClick = {
                                     if (canSend) {
                                         viewModel.sendSms(senderInput.trim(), smsBodyInput.trim(), selectedSimId)
+                                        handledExit = true
+                                        viewModel.clearComposeDraft()
                                         onDismiss()
                                     }
                                 },
@@ -5839,7 +6682,7 @@ fun ComposeSmsDialog(
                                     .testTag("composer_send_action_button")
                             ) {
                                 Icon(
-                                    imageVector = Icons.Default.Send,
+                                    imageVector = Icons.AutoMirrored.Filled.Send,
                                     contentDescription = "Send SMS",
                                     tint = if (canSend) Color.White else Color(0xFF565A6B),
                                     modifier = Modifier.size(16.dp)
@@ -5853,63 +6696,35 @@ fun ComposeSmsDialog(
     }
 
 // ==========================================
-// COMPOSABLE COMPONENT: SIMULATE SMS DIALOG
+// SETTINGS SUB-PAGE: TESTING SANDBOX (SMS Sentry Sandbox simulator)
 // ==========================================
 @Composable
-fun SimulateSmsDialog(viewModel: SmsOrganizerViewModel, onDismiss: () -> Unit) {
+fun TestingSandboxPage(viewModel: SmsOrganizerViewModel, onBack: () -> Unit) {
     var fakeSender by remember { mutableStateOf("") }
     var fakeBody by remember { mutableStateOf("") }
     var selectedSimSlot by remember { mutableStateOf(1) }
+    val context = LocalContext.current
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
-    val scrollState = rememberScrollState()
-    val density = LocalDensity.current
 
-    val scrollbarPaddingPx = with(density) { 10.dp.toPx() }
-    val scrollbarWidthPx = with(density) { 4.dp.toPx() }
-    val scrollbarCornerRadiusPx = with(density) { 2.dp.toPx() }
-    val primaryColor = MaterialTheme.colorScheme.primary
-
-    Dialog(
-        onDismissRequest = onDismiss,
-        properties = DialogProperties(usePlatformDefaultWidth = false)
+    LazyColumn(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp)
+            .imePadding(),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        Card(
-            modifier = Modifier
-                .fillMaxWidth(0.92f)
-                .padding(16.dp)
-                .imePadding(),
-            shape = RoundedCornerShape(24.dp),
-            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E2235)),
-            border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)),
-            elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
-        ) {
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(max = 480.dp)
-                    .verticalScroll(scrollState)
-                    .drawWithContent {
-                        drawContent()
-                        val stateValue = scrollState.value.toFloat()
-                        val maxValue = scrollState.maxValue.toFloat()
-                        if (maxValue > 0f) {
-                            val height = size.height
-                            val scrollbarHeight = (height * height) / (maxValue + height)
-                            val scrollbarOffset = (stateValue / maxValue) * (height - scrollbarHeight)
-                            drawRoundRect(
-                                color = primaryColor.copy(alpha = 0.7f),
-                                topLeft = androidx.compose.ui.geometry.Offset(size.width - scrollbarPaddingPx, scrollbarOffset),
-                                size = androidx.compose.ui.geometry.Size(scrollbarWidthPx, scrollbarHeight),
-                                cornerRadius = androidx.compose.ui.geometry.CornerRadius(scrollbarCornerRadiusPx, scrollbarCornerRadiusPx)
-                            )
-                        }
-                    },
-                verticalArrangement = Arrangement.Top
+        item { SubPageHeader("Testing", onBack) }
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant),
+                shape = RoundedCornerShape(20.dp)
             ) {
                 Column(
                     modifier = Modifier
-                        .padding(start = 20.dp, end = 28.dp, top = 20.dp, bottom = 20.dp)
+                        .padding(16.dp)
                         .fillMaxWidth(),
                     verticalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
@@ -5917,12 +6732,12 @@ fun SimulateSmsDialog(viewModel: SmsOrganizerViewModel, onDismiss: () -> Unit) {
                         text = "SMS Sentry Sandbox",
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold,
-                        color = Color.White
+                        color = MaterialTheme.colorScheme.onSurface
                     )
                     Text(
                         text = "Simulates direct SMS reception. Excellent for seeing how the local ML engine evaluates and organizes lists in modern pipelines offline.",
                         style = MaterialTheme.typography.bodySmall,
-                        color = Color(0xFF8C92AC)
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
 
                     OutlinedTextField(
@@ -5952,7 +6767,7 @@ fun SimulateSmsDialog(viewModel: SmsOrganizerViewModel, onDismiss: () -> Unit) {
                     )
 
                     // Quick pre-fill buttons to test AI categorization!
-                    Text("Pretest Template Scenarios:", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    Text("Pretest Template Scenarios:", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -5962,7 +6777,7 @@ fun SimulateSmsDialog(viewModel: SmsOrganizerViewModel, onDismiss: () -> Unit) {
                                 fakeSender = "ICICIB"
                                 fakeBody = "Your account has been credited for Rs. 15,200.00 via IMPS. Bal: Rs. 94,500.00"
                             },
-                            label = { Text("Bank Trx", fontSize = 11.sp, color = Color.White) },
+                            label = { Text("Bank Trx", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface) },
                             modifier = Modifier.weight(1f)
                         )
                         AssistChip(
@@ -5970,7 +6785,7 @@ fun SimulateSmsDialog(viewModel: SmsOrganizerViewModel, onDismiss: () -> Unit) {
                                 fakeSender = "SBIPAY"
                                 fakeBody = "Outstanding Credit Card minimum payment Rs. 4,500.00 due date 30-05-2026. Please pay."
                             },
-                            label = { Text("Due Bill", fontSize = 11.sp, color = Color.White) },
+                            label = { Text("Due Bill", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface) },
                             modifier = Modifier.weight(1f)
                         )
                     }
@@ -5983,7 +6798,7 @@ fun SimulateSmsDialog(viewModel: SmsOrganizerViewModel, onDismiss: () -> Unit) {
                                 fakeSender = "PROMO_WIN"
                                 fakeBody = "CLAIM FREE BONUS NOW! Click luckybox.io/promocode to unlock your $500 gift voucher right away!"
                             },
-                            label = { Text("Spam Box", fontSize = 11.sp, color = Color.White) },
+                            label = { Text("Spam Box", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface) },
                             modifier = Modifier.weight(1f)
                         )
                         AssistChip(
@@ -5991,7 +6806,7 @@ fun SimulateSmsDialog(viewModel: SmsOrganizerViewModel, onDismiss: () -> Unit) {
                                 fakeSender = "+9198765432"
                                 fakeBody = "Hey there! Long time no see. Let's arrange a telephone meetup next week!"
                             },
-                            label = { Text("Friend Msg", fontSize = 11.sp, color = Color.White) },
+                            label = { Text("Friend Msg", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface) },
                             modifier = Modifier.weight(1f)
                         )
                     }
@@ -6005,7 +6820,7 @@ fun SimulateSmsDialog(viewModel: SmsOrganizerViewModel, onDismiss: () -> Unit) {
                                 fakeSender = "കുരുവിള ജോ ചെറിയാൻ"
                                 fakeBody = "Your otp is 12345"
                             },
-                            label = { Text("Malayalam OTP (12345)", fontSize = 11.sp, color = Color.White) },
+                            label = { Text("Malayalam OTP (12345)", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface) },
                             modifier = Modifier.weight(1f)
                         )
                         AssistChip(
@@ -6013,13 +6828,13 @@ fun SimulateSmsDialog(viewModel: SmsOrganizerViewModel, onDismiss: () -> Unit) {
                                 fakeSender = "Google"
                                 fakeBody = "G-984210 is your Google verification code."
                             },
-                            label = { Text("Google OTP (984210)", fontSize = 11.sp, color = Color.White) },
+                            label = { Text("Google OTP (984210)", fontSize = 11.sp, color = MaterialTheme.colorScheme.onSurface) },
                             modifier = Modifier.weight(1f)
                         )
                     }
 
                     // Sim Selection bar
-                    Text("Inbound Sim Slot Handler:", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.White)
+                    Text("Inbound Sim Slot Handler:", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.onSurface)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(12.dp)
@@ -6035,7 +6850,7 @@ fun SimulateSmsDialog(viewModel: SmsOrganizerViewModel, onDismiss: () -> Unit) {
                                 },
                             contentAlignment = Alignment.Center
                         ) {
-                            Text("SIM Slot 1", color = if (selectedSimSlot == 1) Color.White else MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold)
+                            Text("SIM Slot 1", color = if (selectedSimSlot == 1) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold)
                         }
 
                         Box(
@@ -6049,30 +6864,25 @@ fun SimulateSmsDialog(viewModel: SmsOrganizerViewModel, onDismiss: () -> Unit) {
                                 },
                             contentAlignment = Alignment.Center
                         ) {
-                            Text("SIM Slot 2", color = if (selectedSimSlot == 2) Color.White else MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold)
+                            Text("SIM Slot 2", color = if (selectedSimSlot == 2) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant, fontWeight = FontWeight.Bold)
                         }
                     }
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.End
+                    Button(
+                        onClick = {
+                            if (fakeSender.trim().isEmpty() || fakeBody.trim().isEmpty()) {
+                                Toast.makeText(context, "Enter a sender and message body first.", Toast.LENGTH_SHORT).show()
+                                return@Button
+                            }
+                            viewModel.simulateSmsReceived(fakeSender.trim(), fakeBody.trim(), selectedSimSlot)
+                            Toast.makeText(context, "Simulated SMS delivered to the receiver.", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(48.dp)
+                            .testTag("sandbox_trigger_simulate_button")
                     ) {
-                        TextButton(onClick = onDismiss, modifier = Modifier.height(48.dp)) {
-                            Text("Cancel", color = MaterialTheme.colorScheme.primary)
-                        }
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Button(
-                            onClick = {
-                                if (fakeSender.trim().isEmpty() || fakeBody.trim().isEmpty()) return@Button
-                                viewModel.simulateSmsReceived(fakeSender.trim(), fakeBody.trim(), selectedSimSlot)
-                                onDismiss()
-                            },
-                            modifier = Modifier
-                                .height(48.dp)
-                                .testTag("sandbox_trigger_simulate_button")
-                        ) {
-                            Text("Trigger Simulated Receiver")
-                        }
+                        Text("Trigger Simulated Receiver")
                     }
                 }
             }

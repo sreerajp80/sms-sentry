@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.net.Uri
 import android.provider.CalendarContract
+import android.provider.ContactsContract
 import android.provider.Settings
 import android.widget.Toast
 import androidx.compose.runtime.mutableStateOf
@@ -20,7 +21,9 @@ import `in`.sreerajp.sms_sentry.engine.SyncState
 import `in`.sreerajp.sms_sentry.ui.theme.ThemeStyle
 import `in`.sreerajp.sms_sentry.util.ContactNameResolver
 import `in`.sreerajp.sms_sentry.util.DefaultSmsAppManager
+import `in`.sreerajp.sms_sentry.util.ReminderAlarmScheduler
 import `in`.sreerajp.sms_sentry.util.ScheduledSmsScheduler
+import `in`.sreerajp.sms_sentry.util.SimManager
 import `in`.sreerajp.sms_sentry.util.SmsNotificationHelper
 import `in`.sreerajp.sms_sentry.util.SmsSender
 import kotlinx.coroutines.Dispatchers
@@ -50,6 +53,9 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
 
     // Conversation thread overlay (null = no thread open); holds the sender being viewed.
     var openedThread = mutableStateOf<String?>(null)
+
+    // Sender-info overlay (null = closed); holds the sender whose aggregated info is being viewed.
+    var openedSenderInfo = mutableStateOf<String?>(null)
 
     // Contribution breakdown overlay (null = closed); holds which side of the finance card was
     // tapped so the breakdown can list the SMS summed into that month's credit/debit total.
@@ -82,8 +88,27 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
     var isFinanceLocked = mutableStateOf(true)
     var isFinanceAuthenticated = mutableStateOf(false)
 
-    // SIM defaults
-    var defaultSmsSim = mutableStateOf("Ask Every Time") // "SIM 1", "SIM 2", "Ask Every Time"
+    // SIM defaults — persisted so the composer and the headless quick-reply service agree.
+    var defaultSmsSim = persistedState("default_sms_sim", "Ask Every Time") { // "SIM 1"/"SIM 2"/"Ask Every Time"
+        prefs.edit().putString("default_sms_sim", it).apply()
+    }
+
+    // Active SIM subscriptions (empty without READ_PHONE_STATE / on single-SIM). Drives the SIM
+    // pickers; the app stores the 1-based slot as simId and resolves the real subId on send.
+    private val _activeSims = MutableStateFlow<List<SimManager.SimInfo>>(emptyList())
+    val activeSims: StateFlow<List<SimManager.SimInfo>> = _activeSims.asStateFlow()
+
+    // Auto-mark-read delay (seconds) when a conversation is opened. 0 = Off (disabled).
+    var autoMarkReadDelaySeconds = persistedState("auto_mark_read_secs", 3) {
+        prefs.edit().putInt("auto_mark_read_secs", it).apply()
+    }
+
+    // Global on/off for in-app reminder due-alerts (AlarmManager). Default on. Toggling it
+    // re-reconciles every reminder's alarm (key must match ReminderAlarmScheduler.PREF_ALERTS_ENABLED).
+    var reminderAlertsEnabled = persistedState(ReminderAlarmScheduler.PREF_ALERTS_ENABLED, true) {
+        prefs.edit().putBoolean(ReminderAlarmScheduler.PREF_ALERTS_ENABLED, it).apply()
+        ReminderAlarmScheduler.reconcile(getApplication(), reminders.value)
+    }
 
     // Muted senders (notifications suppressed) — persisted to theme_prefs as a string set.
     var mutedSenders = mutableStateOf(
@@ -94,6 +119,14 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
         prefs.getStringSet("paid_message_ids", emptySet())
             ?.mapNotNull { it.toLongOrNull() }?.toSet() ?: emptySet()
     )
+
+    // Unsent per-thread reply text (sender -> draft). Persisted to a dedicated prefs file so a
+    // draft survives leaving a thread; surfaced as a "Draft" marker on the inbox conversation card.
+    private val draftPrefs = application.getSharedPreferences("drafts", Context.MODE_PRIVATE)
+    private val _drafts = MutableStateFlow<Map<String, String>>(
+        draftPrefs.all.mapNotNull { (k, v) -> (v as? String)?.takeIf { it.isNotBlank() }?.let { k to it } }.toMap()
+    )
+    val drafts: StateFlow<Map<String, String>> = _drafts.asStateFlow()
     
     // Loaded Data Streams
     val allMessages = repository.allMessages.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
@@ -112,6 +145,11 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
     private val _contactNames = MutableStateFlow<Map<String, String>>(emptyMap())
     val contactNames: StateFlow<Map<String, String>> = _contactNames.asStateFlow()
 
+    // Resolved address-book photos for senders (sender -> photo Uri). Only senders with a saved
+    // contact photo appear here; the avatar falls back to a monogram for everything else.
+    private val _contactPhotos = MutableStateFlow<Map<String, Uri>>(emptyMap())
+    val contactPhotos: StateFlow<Map<String, Uri>> = _contactPhotos.asStateFlow()
+
     init {
         viewModelScope.launch {
             if (hasReadSmsPermission()) {
@@ -120,10 +158,20 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
             }
             // No SMS access yet: leave the inbox empty (no demo seeding).
         }
+        // Clear out any reminders whose due date has already passed (one-shot, on launch).
+        viewModelScope.launch {
+            repository.purgeExpiredReminders()
+        }
+        // Single arming funnel: re-reconcile reminder due-alerts whenever the set changes.
+        viewModelScope.launch {
+            reminders.collect { list -> ReminderAlarmScheduler.reconcile(getApplication(), list) }
+        }
         // Resolve contact names as messages arrive; cheap after the first pass (resolver caches).
         viewModelScope.launch {
             allMessages.collect { msgs -> resolveContactNames(msgs.map { it.sender }) }
         }
+        // Enumerate SIMs up front (no-op without READ_PHONE_STATE; refreshed again on grant/resume).
+        refreshActiveSims()
     }
 
     private fun hasReadSmsPermission(): Boolean =
@@ -138,16 +186,19 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
             android.Manifest.permission.READ_CONTACTS
         ) == PackageManager.PERMISSION_GRANTED
 
-    /** Look up address-book names for [senders] off the main thread and publish the matches. */
+    /** Look up address-book names + photos for [senders] off the main thread and publish matches. */
     private suspend fun resolveContactNames(senders: List<String>) {
         if (!hasReadContactsPermission()) return
         val app = getApplication<Application>()
-        val names = withContext(Dispatchers.IO) {
-            senders.distinct()
-                .associateWith { ContactNameResolver.lookup(app, it) }
-                .filter { (sender, name) -> name != sender }
+        val resolved = withContext(Dispatchers.IO) {
+            senders.distinct().associateWith { ContactNameResolver.resolve(app, it) }
         }
-        _contactNames.value = names
+        _contactNames.value = resolved
+            .filter { (sender, info) -> info.name != sender }
+            .mapValues { (_, info) -> info.name }
+        _contactPhotos.value = resolved
+            .mapNotNull { (sender, info) -> info.photoUri?.let { sender to it } }
+            .toMap()
     }
 
     /** Clear cached resolutions and re-resolve current senders (e.g. after a READ_CONTACTS grant). */
@@ -159,6 +210,65 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
     /** Re-read whether we are the default SMS app (call from the Activity's onResume). */
     fun refreshDefaultStatus() {
         isDefaultSmsApp.value = DefaultSmsAppManager.isDefault(getApplication())
+    }
+
+    /** Re-enumerate active SIM subscriptions (call after a READ_PHONE_STATE grant / onResume). */
+    fun refreshActiveSims() {
+        _activeSims.value = SimManager.activeSubscriptions(getApplication())
+    }
+
+    /**
+     * The 1-based slot to send from when the user hasn't picked one (reply row, headless reply).
+     * Honors the persisted default-SIM setting; falls back to slot 1.
+     */
+    fun defaultOutgoingSlot(): Int = when (defaultSmsSim.value) {
+        "SIM 2" -> 2
+        else -> 1
+    }
+
+    // --- Drafts (unsent per-thread reply text) ---
+    /** Current draft for [sender], or empty string when none. */
+    fun draftFor(sender: String): String = _drafts.value[sender] ?: ""
+
+    /** Persist (or clear, when blank) the draft for [sender]. */
+    fun saveDraft(sender: String, text: String) {
+        val trimmed = text
+        if (trimmed.isBlank()) {
+            clearDraft(sender)
+            return
+        }
+        draftPrefs.edit().putString(sender, trimmed).apply()
+        _drafts.value = _drafts.value.toMutableMap().apply { put(sender, trimmed) }
+    }
+
+    /** Remove any saved draft for [sender] (e.g. after sending). */
+    fun clearDraft(sender: String) {
+        if (!_drafts.value.containsKey(sender)) return
+        draftPrefs.edit().remove(sender).apply()
+        _drafts.value = _drafts.value.toMutableMap().apply { remove(sender) }
+    }
+
+    // --- Compose-window draft (single most-recent new-message draft: recipient + body) ---
+    // Kept in theme_prefs, separate from the per-sender draft map, so a free-form recipient never
+    // produces a phantom inbox card. Restored into the composer when it's opened blank.
+    fun composeDraft(): Pair<String, String> =
+        (prefs.getString("compose_draft_recipient", "") ?: "") to (prefs.getString("compose_draft_body", "") ?: "")
+
+    /** Persist (or clear, when both blank) the new-message composer's unsent recipient + body. */
+    fun saveComposeDraft(recipient: String, body: String) {
+        if (recipient.isBlank() && body.isBlank()) {
+            clearComposeDraft()
+            return
+        }
+        prefs.edit()
+            .putString("compose_draft_recipient", recipient)
+            .putString("compose_draft_body", body)
+            .apply()
+    }
+
+    /** Drop the saved compose draft (e.g. after a successful send/schedule). */
+    fun clearComposeDraft() {
+        prefs.edit().remove("compose_draft_recipient").remove("compose_draft_body").apply()
     }
 
     /**
@@ -251,17 +361,34 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
                 isRead = true,
                 status = SMSMessage.STATUS_SENDING
             )
-            dispatchSms(recipient, body, msgId)
+            dispatchSms(recipient, body, msgId, simId)
         }
     }
 
-    /** Fire the actual radio send with sent/delivery PendingIntents carrying the Room message id. */
-    private fun dispatchSms(recipient: String, body: String, msgId: Long) {
+    /**
+     * Fire the actual radio send with sent/delivery PendingIntents carrying the Room message id.
+     * [slot] is the 1-based SIM slot the user chose; it is resolved to a real subscriptionId here.
+     */
+    private fun dispatchSms(recipient: String, body: String, msgId: Long, slot: Int) {
         try {
-            SmsSender.dispatch(getApplication(), recipient, body, msgId)
+            val subId = SimManager.subscriptionIdForSlot(getApplication(), slot)
+            SmsSender.dispatch(getApplication(), recipient, body, msgId, subId)
         } catch (e: Exception) {
             viewModelScope.launch { repository.updateMessageStatus(msgId, SMSMessage.STATUS_FAILED) }
             Toast.makeText(getApplication(), "Failed to send: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    /** Retry a previously-FAILED outgoing message: flip it back to SENDING and re-dispatch. */
+    fun resendMessage(msg: SMSMessage) {
+        if (msg.type != SMSMessage.TYPE_SENT) return
+        if (!isDefaultSmsApp.value) {
+            Toast.makeText(getApplication(), "Set SMS Sentry as your default SMS app to send messages.", Toast.LENGTH_LONG).show()
+            return
+        }
+        viewModelScope.launch {
+            repository.updateMessageStatus(msg.id, SMSMessage.STATUS_SENDING)
+            dispatchSms(msg.sender, msg.body, msg.id, msg.simId)
         }
     }
 
@@ -339,6 +466,62 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
     fun openThread(sender: String) { openedThread.value = sender }
     fun closeThread() { openedThread.value = null }
 
+    /**
+     * If [recipient] already has a conversation, return that thread's canonical sender key;
+     * otherwise null. Lets the composer fold a new message into an existing thread instead of
+     * staying a separate "New message" screen. Phone numbers match on their trailing digits so
+     * `9496135390`, `+91 94961 35390`, etc. resolve to the same thread; alphanumeric sender IDs
+     * (e.g. HDFCBK) match case-insensitively. Name-typed-as-recipient is intentionally not matched.
+     */
+    fun existingThreadFor(recipient: String): String? {
+        val needle = recipient.trim()
+        if (needle.isBlank()) return null
+        val byNumber = ContactNameResolver.isPhoneNumberLike(needle)
+        val needleTail = if (byNumber) digitsTail(needle) else ""
+        return allMessages.value.asSequence()
+            .map { it.sender }
+            .distinct()
+            .firstOrNull { sender ->
+                if (byNumber && ContactNameResolver.isPhoneNumberLike(sender)) {
+                    needleTail.isNotEmpty() && digitsTail(sender) == needleTail
+                } else {
+                    sender.trim().equals(needle, ignoreCase = true)
+                }
+            }
+    }
+
+    /** Digits of [s] only, keeping the trailing 10 (or all when shorter) for number comparison. */
+    private fun digitsTail(s: String): String {
+        val digits = s.filter { it.isDigit() }
+        return if (digits.length > 10) digits.takeLast(10) else digits
+    }
+
+    // --- Sender info navigation ---
+    fun openSenderInfo(sender: String) { openedSenderInfo.value = sender }
+    fun closeSenderInfo() { openedSenderInfo.value = null }
+
+    /** True when [sender] is a phone number with no saved contact — eligible for "Add to contacts". */
+    fun isUnknownContact(sender: String): Boolean =
+        ContactNameResolver.isPhoneNumberLike(sender) && !_contactNames.value.containsKey(sender)
+
+    /**
+     * Hand off to the system Contacts app to create/link a contact for [sender]. Uses
+     * ACTION_INSERT_OR_EDIT so the user can attach the number to an existing contact too. Needs no
+     * WRITE_CONTACTS; works whether or not we're the default SMS app.
+     */
+    fun addToContacts(sender: String) {
+        val intent = Intent(Intent.ACTION_INSERT_OR_EDIT).apply {
+            type = ContactsContract.Contacts.CONTENT_ITEM_TYPE
+            putExtra(ContactsContract.Intents.Insert.PHONE, sender)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        try {
+            getApplication<Application>().startActivity(intent)
+        } catch (e: Exception) {
+            Toast.makeText(getApplication(), "No contacts app available", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     // --- Compose-from-intent (sms:/smsto: links) ---
     fun requestCompose(recipient: String, body: String) {
         composePrefill.value = ComposePrefill(recipient, body)
@@ -370,15 +553,22 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
-    // --- Block / Report / Delete from the card or detail screen ---
-    /** Block a sender: add a CONTACT->Spam rule and remove the message from the inbox. */
-    fun blockSender(msg: SMSMessage) {
-        viewModelScope.launch {
-            repository.addRule("CONTACT", msg.sender, "Spam")
-            repository.deleteMessage(msg)
-        }
+    /**
+     * Open a message from a notification tap: surfaces it over the Inbox so pressing Back
+     * returns to the Inbox (where the message lives) rather than the default Dashboard tab.
+     * Distinct from [openMessageById], which finance/ledger rows reuse to return to Accounts.
+     */
+    fun openMessageFromNotification(messageId: Long) {
+        activeTab.value = "Inbox"
+        openMessageById(messageId)
     }
 
+    /** Switch to the Reminders tab (used when a reminder due-alert notification is tapped). */
+    fun openRemindersFromNotification() {
+        activeTab.value = "Reminders"
+    }
+
+    // --- Block / Report / Delete from the card or detail screen ---
     /** Delete every message from a sender (the whole conversation), syncing to the provider. */
     fun deleteConversation(sender: String) {
         viewModelScope.launch {
@@ -397,6 +587,25 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
                 .filter { it.sender == sender && !it.isRead }
                 .forEach { repository.markAsRead(it.id) }
         }
+    }
+
+    /** Mark every inbound message from a sender as unread (manual override). */
+    fun markConversationUnread(sender: String) {
+        viewModelScope.launch {
+            allMessages.value
+                .filter { it.sender == sender && it.isRead && it.type == SMSMessage.TYPE_INBOX }
+                .forEach { repository.markAsUnread(it.id) }
+        }
+    }
+
+    /** Mark specific messages read (per-message selection action). */
+    fun markMessagesRead(ids: Collection<Long>) {
+        viewModelScope.launch { ids.forEach { repository.markAsRead(it) } }
+    }
+
+    /** Mark specific messages unread (per-message selection action). */
+    fun markMessagesUnread(ids: Collection<Long>) {
+        viewModelScope.launch { ids.forEach { repository.markAsUnread(it) } }
     }
 
     /** Block a sender (add a CONTACT->Spam rule) and clear their current conversation. */
@@ -491,8 +700,23 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
 
     // Delete a reminder
     fun deleteReminder(id: Long) {
+        ReminderAlarmScheduler.cancel(getApplication(), id)
         viewModelScope.launch {
             repository.deleteReminder(id)
+        }
+    }
+
+    /** Toggle the in-app due-alert for a reminder. The reminders Flow re-reconciles the alarm. */
+    fun setReminderAlert(id: Long, enabled: Boolean) {
+        viewModelScope.launch {
+            repository.setReminderAlert(id, enabled)
+        }
+    }
+
+    /** Change a reminder's recurrence cadence (see [ReminderAlarmScheduler]/RecurrenceUtil values). */
+    fun setReminderRecurrence(id: Long, recurrence: String) {
+        viewModelScope.launch {
+            repository.setReminderRecurrence(id, recurrence)
         }
     }
 
@@ -571,6 +795,8 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
     }
 
     // --- Peer to Peer Sync Triggers ---
+    fun generatePairingCode(): String = syncEngine.generatePairingCode()
+
     fun hostSyncServer(pin: String) {
         syncEngine.startHostServer(pin, repository)
     }
@@ -613,11 +839,13 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
+    @Suppress("UNCHECKED_CAST")
     private fun <T> persistedState(key: String, defaultValue: T, saver: (T) -> Unit): androidx.compose.runtime.MutableState<T> {
         val prefs = getApplication<Application>().getSharedPreferences("theme_prefs", Context.MODE_PRIVATE)
         val initialValue = when (defaultValue) {
             is Boolean -> prefs.getBoolean(key, defaultValue) as T
             is String -> prefs.getString(key, defaultValue) as T
+            is Int -> prefs.getInt(key, defaultValue) as T
             else -> defaultValue
         }
         val state = mutableStateOf(initialValue)

@@ -1,5 +1,7 @@
 # Conversation thread: multi-select delete, delete-all, and sender actions menu
 
+**Status:** completed
+
 > **Supersedes** `plans/20260616_074132_sender-actions-to-thread.md`. That plan (move the
 > sender actions from the per-message detail to the thread level) is folded into this one,
 > because the new "delete entire chat" request is the same action and touches the same header.

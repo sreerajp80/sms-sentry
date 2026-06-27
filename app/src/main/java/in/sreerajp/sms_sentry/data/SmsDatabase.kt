@@ -15,7 +15,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
         ReminderSms::class,
         ScheduledSms::class
     ],
-    version = 5,
+    version = 6,
     exportSchema = false
 )
 abstract class SmsDatabase : RoomDatabase() {
@@ -74,6 +74,15 @@ abstract class SmsDatabase : RoomDatabase() {
             }
         }
 
+        // v5 -> v6: add recurrence + in-app alert columns to reminders, for AlarmManager-driven
+        // due alerts and repeating reminders. Existing reminders default to one-shot, alert-on.
+        private val MIGRATION_5_6 = object : Migration(5, 6) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("ALTER TABLE reminders ADD COLUMN recurrence TEXT NOT NULL DEFAULT 'NONE'")
+                db.execSQL("ALTER TABLE reminders ADD COLUMN alertEnabled INTEGER NOT NULL DEFAULT 1")
+            }
+        }
+
         fun getDatabase(context: Context): SmsDatabase {
             return INSTANCE ?: synchronized(this) {
                 val instance = Room.databaseBuilder(
@@ -81,8 +90,8 @@ abstract class SmsDatabase : RoomDatabase() {
                     SmsDatabase::class.java,
                     "sms_organizer_database"
                 )
-                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5)
-                .fallbackToDestructiveMigration()
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
+                .fallbackToDestructiveMigration(dropAllTables = true)
                 .build()
                 INSTANCE = instance
                 instance

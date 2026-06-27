@@ -1,5 +1,7 @@
 # Dashboard "Available Balance" shows ₹ 0.00 while Accounts shows the real balance
 
+**Status:** completed
+
 ## Issue
 
 The Dashboard "AVAILABLE BALANCE" card and the Accounts "ESTIMATED LIQUID SAVINGS" card

@@ -1,5 +1,7 @@
 # Fix: "Host Sync Server" button label wrapping to a second line
 
+**Status:** completed
+
 ## Issue
 
 On the Sync page, the **Host Sync Server** button (left of the two action

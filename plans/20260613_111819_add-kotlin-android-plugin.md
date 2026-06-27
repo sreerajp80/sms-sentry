@@ -1,5 +1,7 @@
 # Add the Kotlin Android Gradle plugin
 
+**Status:** completed
+
 ## Issue
 
 The app crashes at launch with:

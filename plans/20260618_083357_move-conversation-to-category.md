@@ -1,5 +1,7 @@
 # Plan: "Move conversation to folder/category" from Inbox selection
 
+**Status:** completed
+
 ## What the user wants
 
 When one or more conversation cards are selected in the Inbox (long-press → selection

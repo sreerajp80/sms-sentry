@@ -1,5 +1,7 @@
 # Redo finance: correct amount extraction, de-duplication, and accurate ledger/UI
 
+**Status:** completed
+
 ## The issue (reported)
 
 1. Identical SMS delivered twice (same sender/body/timestamp) are stored twice and counted twice

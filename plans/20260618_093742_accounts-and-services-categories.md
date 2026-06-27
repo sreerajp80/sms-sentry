@@ -1,5 +1,7 @@
 # Plan: Rename "Finance" → "Accounts" and add a new broad "Services" category
 
+**Status:** completed
+
 ## Issue / goal
 
 Today the app has four message categories, stored as **plain strings** on each

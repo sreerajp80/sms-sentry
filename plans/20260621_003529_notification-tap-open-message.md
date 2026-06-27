@@ -1,5 +1,7 @@
 # Notification tap does not open the tapped message
 
+**Status:** completed
+
 ## Issue
 
 When a new-SMS notification arrives and the user taps it (or taps the "Open"

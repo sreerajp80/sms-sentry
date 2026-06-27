@@ -9,6 +9,7 @@ import `in`.sreerajp.sms_sentry.data.SmsDatabase
 import `in`.sreerajp.sms_sentry.data.SmsRepository
 import `in`.sreerajp.sms_sentry.data.SystemSmsStore
 import `in`.sreerajp.sms_sentry.util.DefaultSmsAppManager
+import `in`.sreerajp.sms_sentry.util.SimManager
 import `in`.sreerajp.sms_sentry.util.SmsSender
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -54,7 +55,8 @@ class ScheduledSmsReceiver : BroadcastReceiver() {
 
                 if (isDefault) {
                     try {
-                        SmsSender.dispatch(appContext, row.recipient, row.body, msgId)
+                        val subId = SimManager.subscriptionIdForSlot(appContext, row.simId)
+                        SmsSender.dispatch(appContext, row.recipient, row.body, msgId, subId)
                     } catch (e: Exception) {
                         Log.e(TAG, "Scheduled send failed for id=$scheduledId", e)
                         repository.updateMessageStatus(msgId, SMSMessage.STATUS_FAILED)

@@ -21,11 +21,18 @@ object SmsSender {
     /**
      * Fires the radio send for [body] to [recipient], wiring sent/delivery callbacks to the Room
      * row [msgId]. Throws on failure so the caller can mark the row FAILED.
+     *
+     * [subscriptionId] selects which SIM sends the message; pass [SimManager.NO_SUBSCRIPTION]
+     * (the default) to use the system default SIM.
      */
-    fun dispatch(context: Context, recipient: String, body: String, msgId: Long) {
-        @Suppress("DEPRECATION")
-        val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-            context.getSystemService(SmsManager::class.java) else SmsManager.getDefault()
+    fun dispatch(
+        context: Context,
+        recipient: String,
+        body: String,
+        msgId: Long,
+        subscriptionId: Int = SimManager.NO_SUBSCRIPTION
+    ) {
+        val smsManager = smsManagerFor(context, subscriptionId)
 
         val sentIntent = statusPendingIntent(context, SmsSendStatusReceiver.ACTION_SENT, msgId)
         val deliveryIntent = statusPendingIntent(context, SmsSendStatusReceiver.ACTION_DELIVERED, msgId)
@@ -41,6 +48,27 @@ object SmsSender {
             smsManager.sendMultipartTextMessage(recipient, null, parts, sentIntents, deliveryIntents)
         } else {
             smsManager.sendTextMessage(recipient, null, body, sentIntent, deliveryIntent)
+        }
+    }
+
+    /**
+     * Resolve the [SmsManager] to send with. For a valid [subscriptionId] returns the SIM-specific
+     * manager; otherwise (or on any failure) falls back to the system default manager.
+     */
+    fun smsManagerFor(context: Context, subscriptionId: Int): SmsManager {
+        @Suppress("DEPRECATION")
+        val default = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
+            context.getSystemService(SmsManager::class.java) else SmsManager.getDefault()
+        if (subscriptionId < 0) return default
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                default.createForSubscriptionId(subscriptionId)
+            } else {
+                @Suppress("DEPRECATION")
+                SmsManager.getSmsManagerForSubscriptionId(subscriptionId)
+            }
+        } catch (e: Exception) {
+            default
         }
     }
 

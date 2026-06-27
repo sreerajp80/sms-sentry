@@ -1,5 +1,7 @@
 # Inbox & Message-Detail redesign — Direction A ("Secure Cards")
 
+**Status:** completed
+
 ## Source of truth
 
 `SMSSentry.zip` (Claude Design export, copied to `.design_ref/`). The lead design is

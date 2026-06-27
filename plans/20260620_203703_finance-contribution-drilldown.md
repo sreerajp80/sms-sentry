@@ -1,5 +1,7 @@
 # Plan: Tap income / expense → list of contributing SMS (auditable totals)
 
+**Status:** completed
+
 ## What the user wants
 
 On the Finance card, the "Total Credit (This Month)" and "Total Debit (This Month)"

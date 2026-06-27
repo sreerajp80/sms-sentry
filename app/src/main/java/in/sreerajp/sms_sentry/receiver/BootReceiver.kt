@@ -6,6 +6,7 @@ import android.content.Intent
 import android.util.Log
 import `in`.sreerajp.sms_sentry.data.SmsDatabase
 import `in`.sreerajp.sms_sentry.data.SmsRepository
+import `in`.sreerajp.sms_sentry.util.ReminderAlarmScheduler
 import `in`.sreerajp.sms_sentry.util.ScheduledSmsScheduler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -34,6 +35,8 @@ class BootReceiver : BroadcastReceiver() {
                     val triggerAt = row.scheduledTime.coerceAtLeast(now)
                     ScheduledSmsScheduler.schedule(appContext, row.id, triggerAt)
                 }
+                // Alarms are cleared on reboot — re-arm reminder due-alerts too.
+                ReminderAlarmScheduler.reconcile(appContext, repository.getAllRemindersOnce())
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to re-arm scheduled messages after boot", e)
             } finally {

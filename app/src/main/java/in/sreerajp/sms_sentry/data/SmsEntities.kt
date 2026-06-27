@@ -68,5 +68,9 @@ data class ReminderSms(
     val title: String,
     val body: String,
     val dueDate: Long,
-    val isSyncedToCalendar: Boolean = false
+    val isSyncedToCalendar: Boolean = false,
+    /** One of NONE / DAILY / WEEKLY / MONTHLY / YEARLY (see [in.sreerajp.sms_sentry.util.RecurrenceUtil]). */
+    val recurrence: String = "NONE",
+    /** When true, an exact AlarmManager alert is armed for [dueDate]. */
+    val alertEnabled: Boolean = true
 )

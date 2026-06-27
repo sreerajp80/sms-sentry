@@ -17,7 +17,22 @@ suggest — see [docs/architecture.md](docs/architecture.md).
    time). The plan must include:
    - the list of files to be changed,
    - what the issue is,
-   - the plan for the fix.
+   - the plan for the fix,
+   - a `**Status:**` line near the top (immediately under the title).
+
+   **PLAN STATUS — you MUST keep the `Status:` line current as the plan moves through its
+   lifecycle.** Allowed values:
+   - `draft` — being drafted, not yet presented for approval.
+   - `approval_pending` — presented to the user; waiting for explicit approval.
+   - `in_progress` — approved; implementation underway.
+   - `completed` — implementation finished and the change log written.
+   - `dropped` — abandoned / will not be implemented.
+   - `partial_completion` — some of the plan was implemented, the rest was not.
+
+   Normal lifecycle: `draft` → `approval_pending` → `in_progress` → `completed`. Set `draft`
+   on creation, flip to `approval_pending` when presenting for approval, `in_progress` on
+   approval, and `completed` when the change log is written. Use `dropped` or
+   `partial_completion` as terminal states when the plan is abandoned or only partly done.
 
    **MANDATORY APPROVAL GATE — you MUST get explicit consent before implementing.**
    - After writing the plan, STOP. Do not edit, create, or delete any project file

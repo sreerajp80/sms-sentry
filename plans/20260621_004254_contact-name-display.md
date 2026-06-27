@@ -1,5 +1,7 @@
 # Plan: Show contact names instead of phone numbers
 
+**Status:** completed
+
 ## Issue
 
 When an SMS sender's phone number is saved in the device address book, the app still shows

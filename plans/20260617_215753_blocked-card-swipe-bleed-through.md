@@ -1,5 +1,7 @@
 # Fix: Block/Delete swipe panel bleeds through blocked cards (Spam)
 
+**Status:** completed
+
 ## Issue
 
 In the Spam section (and any tab showing blocked senders), the behind-the-card

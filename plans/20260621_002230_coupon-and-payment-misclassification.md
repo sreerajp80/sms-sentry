@@ -1,5 +1,7 @@
 # Fix: coupons logged as credit, and "payment received" logged as credit
 
+**Status:** completed
+
 ## Issues
 
 Two real-world SMS are misclassified by the offline classifier

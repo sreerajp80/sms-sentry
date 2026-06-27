@@ -1,5 +1,7 @@
 # Plan: Category-colored filter pills + leaner cards (border = category)
 
+**Status:** completed
+
 ## The issue / goal
 
 Each category (Personal/Finance/Reminder/Spam) already has a theme-aware color

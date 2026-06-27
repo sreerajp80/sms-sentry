@@ -8,6 +8,7 @@ import android.util.Log
 import `in`.sreerajp.sms_sentry.data.SmsDatabase
 import `in`.sreerajp.sms_sentry.data.SmsRepository
 import `in`.sreerajp.sms_sentry.data.SystemSmsStore
+import `in`.sreerajp.sms_sentry.util.SimManager
 import `in`.sreerajp.sms_sentry.util.SmsNotificationHelper
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -35,10 +36,12 @@ class SmsDeliverReceiver : BroadcastReceiver() {
         val systemStore = SystemSmsStore(context)
         val appContext = context.applicationContext
 
+        // The originating SIM, mapped from the incoming subscription to our 1-based slot.
+        val simId = SimManager.slotForSubscriptionId(context, SimManager.subscriptionIdFromIntent(intent))
+
         for ((sender, mList) in grouped) {
             val fullBody = mList.joinToString(separator = "") { it.displayMessageBody ?: "" }
             val timestamp = mList.first().timestampMillis
-            val simId = 1
 
             CoroutineScope(Dispatchers.IO).launch {
                 try {

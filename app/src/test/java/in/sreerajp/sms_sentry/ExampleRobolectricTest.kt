@@ -7,7 +7,8 @@ import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.test.core.app.ApplicationProvider
 import `in`.sreerajp.sms_sentry.data.SMSMessage
-import `in`.sreerajp.sms_sentry.ui.MessageCard
+import `in`.sreerajp.sms_sentry.ui.CopyOtpChip
+import `in`.sreerajp.sms_sentry.ui.detectOtp
 import `in`.sreerajp.sms_sentry.ui.theme.MyApplicationTheme
 import org.junit.Assert.assertEquals
 import org.junit.Rule
@@ -44,13 +45,8 @@ class ExampleRobolectricTest {
 
     composeTestRule.setContent {
       MyApplicationTheme {
-        MessageCard(
-            msg = otpMessage,
-            entityText = null,
-            onOpen = {},
-            onDelete = {},
-            onBlock = {}
-        )
+        val otp = detectOtp(otpMessage.body)
+        if (otp != null) CopyOtpChip(otp = otp, msgId = otpMessage.id)
       }
     }
 
@@ -73,13 +69,8 @@ class ExampleRobolectricTest {
 
     composeTestRule.setContent {
       MyApplicationTheme {
-        MessageCard(
-            msg = normalMessage,
-            entityText = null,
-            onOpen = {},
-            onDelete = {},
-            onBlock = {}
-        )
+        val otp = detectOtp(normalMessage.body)
+        if (otp != null) CopyOtpChip(otp = otp, msgId = normalMessage.id)
       }
     }
 

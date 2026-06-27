@@ -1,5 +1,7 @@
 # Plan: Stronger unread cue + more compact message cards
 
+**Status:** completed
+
 ## The issue
 
 After adding read/unread status, the visual difference between read and unread cards is too

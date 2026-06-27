@@ -55,7 +55,8 @@ class SmsRepository(private val smsDao: SmsDao) {
             sender = sender,
             body = body,
             customKeywords = customKeywords,
-            customContacts = customContacts
+            customContacts = customContacts,
+            referenceTime = timestamp
         )
 
         // 3. Create & insert SMSMessage
@@ -181,6 +182,11 @@ class SmsRepository(private val smsDao: SmsDao) {
         smsDao.markMessageRead(id)
     }
 
+    /** Mark a message as unread (manual override from the thread/inbox selection actions). */
+    suspend fun markAsUnread(id: Long) {
+        smsDao.markMessageUnread(id)
+    }
+
     /** Look up the source SMS for a finance/reminder row by its messageId. */
     suspend fun getMessageById(id: Long): SMSMessage? = smsDao.getMessageById(id)
 
@@ -214,7 +220,8 @@ class SmsRepository(private val smsDao: SmsDao) {
             sender = message.sender,
             body = message.body,
             customKeywords = customKeywords,
-            customContacts = customContacts
+            customContacts = customContacts,
+            referenceTime = message.timestamp
         )
 
         smsDao.updateMessageCategory(message.id, classification.category)
@@ -272,7 +279,8 @@ class SmsRepository(private val smsDao: SmsDao) {
             sender = message.sender,
             body = message.body,
             customKeywords = emptyList(),
-            customContacts = mapOf(message.sender to targetCategory)
+            customContacts = mapOf(message.sender to targetCategory),
+            referenceTime = message.timestamp
         )
 
         smsDao.updateMessageCategory(message.id, targetCategory)
@@ -377,14 +385,17 @@ class SmsRepository(private val smsDao: SmsDao) {
         }
 
         val messages = smsDao.getAllMessagesOnce()
-        val reminderMessageIds = smsDao.getReminderMessageIds().toHashSet()
+        // Existing reminders keyed by message id, so a re-classify can *update* a stale due date
+        // (e.g. a historic 3-day fallback) rather than skipping the message entirely.
+        val remindersByMessageId = smsDao.getAllRemindersOnce().associateBy { it.messageId }
 
         for (message in messages) {
             val classification = SmsClassifier.classify(
                 sender = message.sender,
                 body = message.body,
                 customKeywords = customKeywords,
-                customContacts = customContacts
+                customContacts = customContacts,
+                referenceTime = message.timestamp
             )
 
             smsDao.updateMessageCategory(message.id, classification.category)
@@ -405,23 +416,33 @@ class SmsRepository(private val smsDao: SmsDao) {
                 )
             }
 
-            // Reminders may be manual — only add when the message is flagged and has none yet.
-            if (classification.isReminder && classification.dueDate != null &&
-                message.id !in reminderMessageIds
-            ) {
-                smsDao.insertReminder(
-                    ReminderSms(
-                        messageId = message.id,
-                        sender = message.sender,
-                        title = classification.reminderTitle ?: "SMS Reminder",
-                        body = message.body,
-                        dueDate = classification.dueDate,
-                        isSyncedToCalendar = false
+            // Reminders may be manual. Insert when the message is flagged and has none yet;
+            // when one already exists, refresh its (possibly stale) due date in place so an
+            // improved date parse — or a corrected fallback — takes effect on re-categorize.
+            if (classification.isReminder && classification.dueDate != null) {
+                val existing = remindersByMessageId[message.id]
+                if (existing == null) {
+                    smsDao.insertReminder(
+                        ReminderSms(
+                            messageId = message.id,
+                            sender = message.sender,
+                            title = classification.reminderTitle ?: "SMS Reminder",
+                            body = message.body,
+                            dueDate = classification.dueDate,
+                            isSyncedToCalendar = false
+                        )
                     )
-                )
-                reminderMessageIds.add(message.id)
+                } else if (existing.dueDate != classification.dueDate) {
+                    smsDao.updateReminderDueDate(existing.id, classification.dueDate)
+                }
             }
         }
+
+        // Drop any one-shot reminders whose due date has already passed, so re-categorization
+        // ends in the same clean state as launch (it must not revive reminders the launch-time
+        // purge already removed). Recurring reminders and ones due today are kept.
+        purgeExpiredReminders()
+
         return messages.size
     }
 
@@ -437,6 +458,38 @@ class SmsRepository(private val smsDao: SmsDao) {
 
     suspend fun updateReminderSyncState(id: Long, isSynced: Boolean) {
         smsDao.updateReminderSyncState(id, isSynced)
+    }
+
+    suspend fun getReminderById(id: Long): ReminderSms? = smsDao.getReminderById(id)
+
+    /** One-shot snapshot of all reminders, used by boot-time alarm re-arming. */
+    suspend fun getAllRemindersOnce(): List<ReminderSms> = smsDao.getAllRemindersOnce()
+
+    suspend fun setReminderAlert(id: Long, enabled: Boolean) {
+        smsDao.updateReminderAlert(id, enabled)
+    }
+
+    suspend fun setReminderRecurrence(id: Long, recurrence: String) {
+        smsDao.updateReminderRecurrence(id, recurrence)
+    }
+
+    /** Move a reminder's due date forward (used when a recurring alarm fires). */
+    suspend fun advanceReminderDueDate(id: Long, dueDate: Long) {
+        smsDao.updateReminderDueDate(id, dueDate)
+    }
+
+    /**
+     * Drop reminders whose due date is already in the past. The cutoff is the start of *today*
+     * (local midnight) so a reminder due today is still kept and shown.
+     */
+    suspend fun purgeExpiredReminders() {
+        val cutoff = java.util.Calendar.getInstance().apply {
+            set(java.util.Calendar.HOUR_OF_DAY, 0)
+            set(java.util.Calendar.MINUTE, 0)
+            set(java.util.Calendar.SECOND, 0)
+            set(java.util.Calendar.MILLISECOND, 0)
+        }.timeInMillis
+        smsDao.deleteExpiredReminders(cutoff)
     }
 
     // Bulk Seed for empty states/demo

@@ -1,5 +1,7 @@
 # Fix: Unresolved reference `ACTION_RESPOND_VIA_MESSAGE`
 
+**Status:** completed
+
 ## Files to be changed
 
 - `app/src/main/java/in/sreerajp/sms_sentry/receiver/HeadlessSmsSendService.kt`

@@ -1,5 +1,7 @@
 # Rebuild the Dashboard screen to match the Claude Design mockup
 
+**Status:** completed
+
 ## What the issue is
 The earlier change ported the mockup's **colours + font** onto the *existing* Dashboard
 layout. The user expected the Dashboard **layout/components** to match the mockup

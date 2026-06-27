@@ -1,5 +1,7 @@
 # Inbox: long-press a card to select it + contextual action menu
 
+**Status:** completed
+
 ## Issue / feature request
 
 On the inbox list, long-pressing a conversation card should **select** it (with a visible

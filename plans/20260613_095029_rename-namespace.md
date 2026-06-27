@@ -1,5 +1,7 @@
 # Rename namespace + applicationId to `in.sreerajp.sms_sentry`
 
+**Status:** completed
+
 ## Issue
 
 The app currently ships with the placeholder Android Studio identity:

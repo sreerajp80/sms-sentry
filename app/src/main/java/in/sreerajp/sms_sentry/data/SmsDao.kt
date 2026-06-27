@@ -21,9 +21,6 @@ interface SmsDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertMessage(message: SMSMessage): Long
 
-    @Insert(onConflict = OnConflictStrategy.REPLACE)
-    suspend fun insertMessages(messages: List<SMSMessage>)
-
     @Delete
     suspend fun deleteMessage(message: SMSMessage)
 
@@ -67,6 +64,9 @@ interface SmsDao {
     @Query("UPDATE messages SET isRead = 1 WHERE id = :id")
     suspend fun markMessageRead(id: Long)
 
+    @Query("UPDATE messages SET isRead = 0 WHERE id = :id")
+    suspend fun markMessageUnread(id: Long)
+
     // --- Filter Rules ---
     @Query("SELECT * FROM filter_rules")
     fun getAllRules(): Flow<List<FilterRule>>
@@ -88,9 +88,6 @@ interface SmsDao {
     @Query("DELETE FROM filter_rules WHERE id = :id")
     suspend fun deleteRuleById(id: Long)
 
-    @Query("SELECT * FROM filter_rules WHERE type = 'KEYWORD'")
-    suspend fun getKeywordRules(): List<FilterRule>
-
     @Query("SELECT * FROM filter_rules WHERE type = 'CONTACT'")
     suspend fun getContactRules(): List<FilterRule>
 
@@ -105,17 +102,40 @@ interface SmsDao {
     suspend fun deleteAllTransactions()
 
     // --- Reminders ---
-    @Query("SELECT * FROM reminders ORDER BY dueDate ASC")
+    @Query("SELECT * FROM reminders ORDER BY dueDate DESC")
     fun getAllReminders(): Flow<List<ReminderSms>>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertReminder(reminder: ReminderSms): Long
 
+    @Query("SELECT * FROM reminders WHERE id = :id LIMIT 1")
+    suspend fun getReminderById(id: Long): ReminderSms?
+
+    /** One-shot snapshot for boot-time alarm re-arming. */
+    @Query("SELECT * FROM reminders ORDER BY dueDate ASC")
+    suspend fun getAllRemindersOnce(): List<ReminderSms>
+
     @Query("UPDATE reminders SET isSyncedToCalendar = :isSynced WHERE id = :id")
     suspend fun updateReminderSyncState(id: Long, isSynced: Boolean)
 
+    @Query("UPDATE reminders SET alertEnabled = :enabled WHERE id = :id")
+    suspend fun updateReminderAlert(id: Long, enabled: Boolean)
+
+    @Query("UPDATE reminders SET recurrence = :recurrence WHERE id = :id")
+    suspend fun updateReminderRecurrence(id: Long, recurrence: String)
+
+    @Query("UPDATE reminders SET dueDate = :dueDate WHERE id = :id")
+    suspend fun updateReminderDueDate(id: Long, dueDate: Long)
+
     @Query("DELETE FROM reminders WHERE id = :id")
     suspend fun deleteReminder(id: Long)
+
+    /**
+     * Remove one-shot reminders whose due date has already passed (cutoff = start of today).
+     * Recurring reminders are never purged — they advance to their next occurrence instead.
+     */
+    @Query("DELETE FROM reminders WHERE dueDate < :cutoff AND recurrence = 'NONE'")
+    suspend fun deleteExpiredReminders(cutoff: Long)
 
     // --- Scheduled (future-delivery) messages ---
     @Query("SELECT * FROM scheduled_messages ORDER BY scheduledTime ASC")

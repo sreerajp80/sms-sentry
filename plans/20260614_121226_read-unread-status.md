@@ -1,5 +1,7 @@
 # Plan: Read / Unread status for messages
 
+**Status:** completed
+
 ## The issue
 
 SMS Sentry has **no concept of read vs unread** anywhere — not in the data model

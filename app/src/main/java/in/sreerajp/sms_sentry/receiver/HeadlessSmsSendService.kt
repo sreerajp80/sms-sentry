@@ -1,11 +1,13 @@
 package `in`.sreerajp.sms_sentry.receiver
 
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.os.IBinder
-import android.telephony.SmsManager
 import android.telephony.TelephonyManager
 import android.util.Log
+import `in`.sreerajp.sms_sentry.util.SimManager
+import `in`.sreerajp.sms_sentry.util.SmsSender
 
 /**
  * Handles `RESPOND_VIA_MESSAGE` — the "reply with a message" action shown when rejecting a call.
@@ -24,8 +26,10 @@ class HeadlessSmsSendService : Service() {
                 val message = intent.getStringExtra(Intent.EXTRA_TEXT)
                 val recipients = intent.data?.schemeSpecificPart
                 if (!message.isNullOrBlank() && !recipients.isNullOrBlank()) {
-                    @Suppress("DEPRECATION")
-                    val smsManager = SmsManager.getDefault()
+                    // Send on the user's preferred default SIM (slot -> subscriptionId); falls back
+                    // to the system default SIM when unset or unresolvable.
+                    val subId = SimManager.subscriptionIdForSlot(this, defaultOutgoingSlot())
+                    val smsManager = SmsSender.smsManagerFor(this, subId)
                     recipients.split(",", ";").map { it.trim() }.filter { it.isNotEmpty() }.forEach { number ->
                         smsManager.sendTextMessage(number, null, message, null, null)
                     }
@@ -36,5 +40,11 @@ class HeadlessSmsSendService : Service() {
         }
         stopSelf(startId)
         return START_NOT_STICKY
+    }
+
+    /** Read the persisted default-outgoing-SIM setting as a 1-based slot (falls back to slot 1). */
+    private fun defaultOutgoingSlot(): Int {
+        val prefs = getSharedPreferences("theme_prefs", Context.MODE_PRIVATE)
+        return if (prefs.getString("default_sms_sim", "Ask Every Time") == "SIM 2") 2 else 1
     }
 }

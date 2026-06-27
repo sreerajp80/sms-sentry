@@ -1,5 +1,7 @@
 # Plan: Implement real Scheduled SMS Delivery
 
+**Status:** completed
+
 ## The issue
 
 The composer's clock icon ([SmsOrganizerUi.kt:5006-5019](../app/src/main/java/in/sreerajp/sms_sentry/ui/SmsOrganizerUi.kt#L5006-L5019))

@@ -62,9 +62,9 @@ directly.
 ## Things worth knowing before changing behavior
 
 - Classification is **100% offline** regex/keyword heuristics. Despite `metadata.json` / `.env`
-  advertising a `GEMINI_API_KEY` and a server-side Gemini capability, no network LLM call exists;
-  `firebase-ai` is commented out in [../app/build.gradle.kts](../app/build.gradle.kts). Don't assume
-  a Gemini code path exists.
+  advertising a `GEMINI_API_KEY` and a server-side Gemini capability, no network LLM call exists.
+  The Gemini/`firebase-ai` path was never implemented, and Firebase has been removed from the
+  build entirely. Don't assume a Gemini code path exists.
 - The app **can optionally be the default SMS app** (Settings ▸ System integration ▸ "Set as
   default SMS app", via [DefaultSmsAppManager](../app/src/main/java/in/sreerajp/sms_sentry/util/DefaultSmsAppManager.kt)).
   Two ingestion paths exist:
@@ -90,13 +90,47 @@ directly.
   `version = 3` (`MIGRATION_2_3` adds these columns).
 - The Inbox is **grouped into per-sender conversations** (`ConversationCard` → `ThreadScreen`
   chat view); the still-present `MessageCard` is used by the detail/test path.
-- **P2P sync security is intentionally weak / for-demo:** AES/ECB/PKCS5 with the key derived by
-  padding the user PIN to 16 bytes, falling back to a XOR cipher, over a plaintext `ServerSocket`
-  on **port 8243**. The host serializes its messages to JSON and sends them; the client
-  re-runs them through `processAndInsertMessage` (re-classifying on import). Treat this as
-  insecure-by-design unless explicitly asked to harden it.
+- **P2P sync payload encryption (high-entropy pairing code):** the sync payload is protected
+  with `AES/GCM/NoPadding`, the key derived via `PBKDF2WithHmacSHA256` over a per-session random
+  salt (`deriveKey` in
+  [P2PSyncEngine.kt](../app/src/main/java/in/sreerajp/sms_sentry/engine/P2PSyncEngine.kt)).
+  The shared secret is **not** a 4–6 digit PIN but a **high-entropy pairing code**:
+  `generatePairingCode()` makes a fresh 64-char code over a 31-symbol unambiguous alphabet
+  (no `0/O/1/I/L`) → ~320 bits, generated per hosting session, shown on the host (grouped 8×8,
+  with a copy button) and **typed into the client out-of-band — it never travels over the
+  socket**. Both sides `normalizeCode()` (uppercase, strip separators) so a copied code matches.
+  That high entropy is what makes the scheme secure without a PAKE: an eavesdropper who captures
+  the whole handshake cannot brute-force the code offline, an active MITM cannot establish a
+  session without it, and because the code is per-session there is no long-term key to compromise
+  (effective forward secrecy). Handshake: host sends the salt in the clear, then the client
+  sends a GCM-encrypted `HELLO_SYNC` — a wrong code yields a wrong key, so GCM tag verification
+  fails and the connection is rejected (no plaintext comparison, **no** fallback cipher). Each
+  message is `Base64.NO_WRAP(IV ‖ ciphertext+tag)`. Robustness: line reads are bounded
+  (`readBoundedLine`, 4 KB handshake / 64 MB payload) and the socket has a 30 s read timeout to
+  resist OOM/DoS; imported JSON is validated (message-count cap, per-field size cap, positive
+  timestamp) before the untrusted peer's data reaches `processAndInsertMessage`. The transport
+  is still a plaintext `ServerSocket` on **port 8243** (no TLS) — the *payload*, not the socket,
+  is authenticated-encrypted, which is sufficient given the code never crosses the wire. The host
+  serializes its messages to JSON and sends them; the client re-runs them through
+  `processAndInsertMessage` (re-classifying on import). This is a breaking wire-protocol change:
+  both devices must run this build to sync.
 - Accounts tab (the money ledger; internal names still `isFinance*`/`FinanceScreen`) is gated behind a
   device-auth lock (`isFinanceLocked` / `triggerDeviceAuthentication`). This lock is the "finance
   security": it survived the four-category consolidation because the ledger is a derived view over
   `FinanceTx` rows (written off the `isFinance` flag), not the `"Accounts"` category that no longer
   exists.
+- **Reminder due-alerts + recurrence (AlarmManager):** each `ReminderSms` carries `alertEnabled`
+  (default on) and a `recurrence` (`NONE`/`DAILY`/`WEEKLY`/`MONTHLY`/`YEARLY`, see
+  [RecurrenceUtil](../app/src/main/java/in/sreerajp/sms_sentry/util/RecurrenceUtil.kt); DB
+  `version = 6`, `MIGRATION_5_6`). [ReminderAlarmScheduler](../app/src/main/java/in/sreerajp/sms_sentry/util/ReminderAlarmScheduler.kt)
+  arms an exact alarm (mirroring `ScheduledSmsScheduler`) at **09:00 local on the due date** for
+  date-only due times. The **single arming funnel** is `ReminderAlarmScheduler.reconcile()`, which
+  the ViewModel calls on every `reminders` Flow emission (idempotent via `FLAG_UPDATE_CURRENT`) and
+  `BootReceiver` calls from a one-shot snapshot after reboot; arming also honors a global toggle
+  (`reminder_alerts_enabled` in `theme_prefs`) and the exact-alarm permission.
+  [ReminderAlarmReceiver](../app/src/main/java/in/sreerajp/sms_sentry/receiver/ReminderAlarmReceiver.kt)
+  posts the notification (channel `sms_sentry_reminders`), advances recurring reminders to their
+  next future occurrence and re-arms, and handles the notification "Done" action. Recurring
+  reminders are excluded from the expiry purge (`deleteExpiredReminders` filters `recurrence = 'NONE'`).
+  This is **in addition to** the older manual "Add to calendar" path (`addEventToCalendar`, an
+  `ACTION_INSERT` hand-off to an external calendar app), which is unchanged.
