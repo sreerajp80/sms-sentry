@@ -1,3 +1,5 @@
+import java.text.SimpleDateFormat
+import java.util.Date
 import java.util.Properties
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 
@@ -30,7 +32,11 @@ android {
     minSdk = 24
     targetSdk = 36
     versionCode = 16
-    versionName = "16.0"
+    versionName = "16.5"
+
+    // Real build date, injected at build time and shown on the About screen.
+    val buildDate = SimpleDateFormat("yyyy-MM-dd").format(Date())
+    buildConfigField("String", "BUILD_DATE", "\"$buildDate\"")
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -112,6 +118,7 @@ dependencies {
   implementation(libs.okhttp)
   // implementation(libs.play.services.location)
   implementation(libs.retrofit)
+  implementation(libs.zxing.android.embedded)
   testImplementation(libs.androidx.compose.ui.test.junit4)
   testImplementation(libs.androidx.core)
   testImplementation(libs.androidx.junit)

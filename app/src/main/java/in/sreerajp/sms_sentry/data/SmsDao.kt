@@ -46,6 +46,25 @@ interface SmsDao {
     @Query("UPDATE messages SET status = :status WHERE id = :id")
     suspend fun updateStatus(id: Long, status: Int)
 
+    /**
+     * Overwrite the syncable fields of an existing message in place (used by P2P full-clone
+     * import when the same message already exists on a re-run — "host overwrites"). Leaves the
+     * device-specific columns (systemId/threadId/attachmentUri) untouched.
+     */
+    @Query(
+        "UPDATE messages SET category = :category, isBlocked = :isBlocked, isRead = :isRead, " +
+            "type = :type, status = :status, simId = :simId WHERE id = :id"
+    )
+    suspend fun updateMessageSyncFields(
+        id: Long,
+        category: String,
+        isBlocked: Boolean,
+        isRead: Boolean,
+        type: Int,
+        status: Int,
+        simId: Int
+    )
+
     @Query("DELETE FROM finance_transactions WHERE messageId = :id")
     suspend fun deleteTransactionByMessageId(id: Long)
 
@@ -94,6 +113,10 @@ interface SmsDao {
     // --- Finance Transactions ---
     @Query("SELECT * FROM finance_transactions ORDER BY timestamp DESC")
     fun getAllTransactions(): Flow<List<FinanceTx>>
+
+    /** One-shot read of every finance row (used to build the P2P full-clone snapshot). */
+    @Query("SELECT * FROM finance_transactions")
+    suspend fun getAllTransactionsOnce(): List<FinanceTx>
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertTransaction(transaction: FinanceTx): Long

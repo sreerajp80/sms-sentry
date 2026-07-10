@@ -1,13 +1,23 @@
 package `in`.sreerajp.sms_sentry.engine
 
+import android.content.Context
 import android.util.Base64
 import `in`.sreerajp.sms_sentry.data.SMSMessage
 import `in`.sreerajp.sms_sentry.data.SmsRepository
+import `in`.sreerajp.sms_sentry.data.SyncFinance
+import `in`.sreerajp.sms_sentry.data.SyncMessage
+import `in`.sreerajp.sms_sentry.data.SyncReminder
+import `in`.sreerajp.sms_sentry.data.SyncRule
+import `in`.sreerajp.sms_sentry.data.ScheduledSms
+import `in`.sreerajp.sms_sentry.util.ScheduledSmsScheduler
+import `in`.sreerajp.sms_sentry.util.SyncSettings
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -29,11 +39,67 @@ import javax.crypto.spec.SecretKeySpec
 
 sealed class SyncState {
     object Idle : SyncState()
-    data class Hosting(val ipAddress: String, val port: Int, val code: String) : SyncState()
+
+    /**
+     * Host is listening. [clientConnected] flips true once a peer has authenticated and the
+     * connection is held open waiting for the sender to choose what to share; [sending] is true
+     * while the chosen payload is being pushed.
+     */
+    data class Hosting(
+        val ipAddress: String,
+        val port: Int,
+        val code: String,
+        val clientConnected: Boolean = false,
+        val sending: Boolean = false
+    ) : SyncState()
+
     object Connecting : SyncState()
+
+    /** Client has authenticated and is waiting for the sender to pick and push the payload. */
+    object WaitingForSender : SyncState()
+
     object Syncing : SyncState()
-    data class Completed(val importedCount: Int, val exportedCount: Int) : SyncState()
+
+    /**
+     * [exportedCount] is set on the host (messages shared); [addedCount] / [skippedCount] are
+     * set on the client (rows newly added vs. kept because they already existed). [importedCount]
+     * mirrors [addedCount] for backward compatibility with the existing UI.
+     */
+    data class Completed(
+        val importedCount: Int,
+        val exportedCount: Int,
+        val addedCount: Int = 0,
+        val skippedCount: Int = 0
+    ) : SyncState()
+
     data class Error(val message: String) : SyncState()
+}
+
+/**
+ * Which categories the host chooses to push in a selective sync. Finance and reminder rows link
+ * to a message by index, so selecting either implies messages are carried too (see
+ * [includesMessages]).
+ */
+data class SyncSelection(
+    val messages: Boolean,
+    val rules: Boolean,
+    val finance: Boolean,
+    val reminders: Boolean,
+    val scheduled: Boolean,
+    val settings: Boolean
+) {
+    /** Messages must travel whenever finance/reminders do, since those link to a message by index. */
+    val includesMessages: Boolean get() = messages || finance || reminders
+
+    /** True when at least one category is selected (used to enable the "Send selected" action). */
+    val hasAny: Boolean get() = messages || rules || finance || reminders || scheduled || settings
+
+    companion object {
+        fun full() = SyncSelection(
+            messages = true, rules = true, finance = true,
+            reminders = true, scheduled = true, settings = true
+        )
+    }
 }
 
 class P2PSyncEngine {
@@ -41,9 +107,21 @@ class P2PSyncEngine {
     private val _syncState = MutableStateFlow<SyncState>(SyncState.Idle)
     val syncState: StateFlow<SyncState> = _syncState
 
-    private var serverSocket: ServerSocket? = null
     private val scope = CoroutineScope(Dispatchers.IO)
     private val secureRandom = SecureRandom()
+
+    // --- Held-open host session state (see connect-then-choose below) ---
+    private var serverSocket: ServerSocket? = null
+    @Volatile private var activeSocket: Socket? = null
+    @Volatile private var activeWriter: PrintWriter? = null
+    @Volatile private var activeKey: SecretKeySpec? = null
+    @Volatile private var authenticated = false
+    @Volatile private var stopped = false
+    private var idleJob: Job? = null
+    private var dropJob: Job? = null
+    private var hostIp: String = "127.0.0.1"
+    private var hostPort: Int = 0
+    private var hostCode: String = ""
 
     // Authenticated symmetric encryption for the sync channel.
     // The key is derived from a high-entropy pairing code with PBKDF2-HMAC-SHA256 over a
@@ -54,15 +132,13 @@ class P2PSyncEngine {
     //
     // The pairing code is ~320 bits (64 chars over a 31-symbol unambiguous alphabet),
     // generated fresh per hosting session and transferred out-of-band (shown on the host,
-    // typed into the client) — it never travels over the socket. That high entropy is what
-    // makes the scheme safe without a PAKE: an eavesdropper who captures the whole handshake
-    // cannot brute-force the code offline, an active MITM cannot establish a session without
-    // it, and because the code is per-session there is no long-term key to compromise.
+    // typed or scanned into the client) — it never travels over the socket. That high entropy
+    // is what makes the scheme safe without a PAKE.
     companion object {
         const val SALT_LEN = 16
         const val IV_LEN = 12
         const val GCM_TAG_BITS = 128
-        const val PBKDF2_ITERATIONS = 120_000
+        const val PBKDF2_ITERATIONS = 300_000
         const val PBKDF2_KEY_BITS = 256
 
         // Pairing code: unambiguous alphabet (no 0/O/1/I/L) for reliable transcription.
@@ -75,9 +151,33 @@ class P2PSyncEngine {
         private const val MAX_PAYLOAD_LINE = 64 * 1024 * 1024 // 64 MB
         private const val SOCKET_TIMEOUT_MS = 30_000
 
+        // After ACCEPT the sender is choosing what to share, so the client waits much longer for
+        // the payload than for a single handshake line.
+        private const val PAYLOAD_WAIT_MS = 600_000 // 10 min
+
+        // Host auto-stops if no peer authenticates within this window.
+        private const val HOST_IDLE_TIMEOUT_MS = 120_000L // 2 min
+
+        // Connect-then-choose full-clone wire format version. v:3 holds the connection open after
+        // ACCEPT and pushes a selective, add-only payload. Incompatible with v:2 (immediate-send)
+        // and with the old 120k KDF — both phones must run this build.
+        const val PAYLOAD_VERSION = 3
+
         // Imported-payload caps (the peer is untrusted even after authentication).
         private const val MAX_MESSAGES = 100_000
+        private const val MAX_RULES = 10_000
+        private const val MAX_FINANCE = 100_000
+        private const val MAX_REMINDERS = 100_000
+        private const val MAX_SCHEDULED = 10_000
         private const val MAX_FIELD_LEN = 100_000
+
+        // Handshake literals (sent ENCRYPTED, never in clear).
+        private const val MSG_HELLO = "HELLO_SYNC"
+        private const val MSG_ACCEPT = "ACCEPT_SYNC"
+        private const val MSG_DENIED = "DENIED"
+
+        const val SYNC_MODE_FULL = "full"
+        const val SYNC_MODE_INCREMENTAL = "incremental"
     }
 
     // `internal` (not private) on the crypto primitives below is a deliberate test seam:
@@ -132,14 +232,115 @@ class P2PSyncEngine {
     }
 
     // Decrypts and verifies the GCM tag. Throws on tamper / wrong key — callers treat a
-    // throw as authentication failure (wrong PIN) and abort the sync.
+    // throw as authentication failure (wrong PIN) and abort the sync. The length guard makes a
+    // truncated ciphertext fail cleanly instead of throwing IndexOutOfBounds in copyOfRange.
     internal fun decrypt(encoded: String, key: SecretKeySpec): String {
         val all = Base64.decode(encoded, Base64.NO_WRAP)
+        if (all.size <= IV_LEN) throw java.io.IOException("Malformed ciphertext")
         val iv = all.copyOfRange(0, IV_LEN)
         val ct = all.copyOfRange(IV_LEN, all.size)
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         cipher.init(Cipher.DECRYPT_MODE, key, GCMParameterSpec(GCM_TAG_BITS, iv))
         return String(cipher.doFinal(ct), Charsets.UTF_8)
+    }
+
+    // Serializes the selected parts of a snapshot to the v:3 JSON payload. A category key is
+    // present only when it is selected, so the receiver can tell "0 sent" from "not included".
+    // `internal` as a test seam so a module-local test can round-trip build → parse.
+    internal fun buildSyncPayload(
+        snapshot: `in`.sreerajp.sms_sentry.data.SyncSnapshot,
+        selection: SyncSelection,
+        syncMode: String,
+        settings: JSONObject?
+    ): String {
+        val root = JSONObject()
+        root.put("v", PAYLOAD_VERSION)
+        root.put("syncMode", syncMode)
+
+        // Messages must be present whenever finance/reminders are, since those link by index.
+        if (selection.includesMessages) {
+            val msgArr = JSONArray()
+            snapshot.messages.forEachIndexed { idx, m ->
+                msgArr.put(JSONObject().apply {
+                    put("idx", idx)
+                    put("sender", m.sender)
+                    put("body", m.body)
+                    put("timestamp", m.timestamp)
+                    put("category", m.category)
+                    put("simId", m.simId)
+                    put("isBlocked", m.isBlocked)
+                    put("isRead", m.isRead)
+                    put("type", m.type)
+                    put("isMms", m.isMms)
+                    put("status", m.status)
+                })
+            }
+            root.put("messages", msgArr)
+        }
+
+        if (selection.rules) {
+            val ruleArr = JSONArray()
+            for (r in snapshot.rules) {
+                ruleArr.put(JSONObject().apply {
+                    put("type", r.type)
+                    put("value", r.value)
+                    put("targetCategory", r.targetCategory)
+                })
+            }
+            root.put("rules", ruleArr)
+        }
+
+        if (selection.finance) {
+            val finArr = JSONArray()
+            for (f in snapshot.finance) {
+                finArr.put(JSONObject().apply {
+                    put("msgIdx", f.msgIdx)
+                    put("bankName", f.bankName)
+                    put("amount", f.amount)
+                    put("isCredit", f.isCredit)
+                    put("balance", f.balance)
+                    put("timestamp", f.timestamp)
+                })
+            }
+            root.put("finance", finArr)
+        }
+
+        if (selection.reminders) {
+            val remArr = JSONArray()
+            for (r in snapshot.reminders) {
+                remArr.put(JSONObject().apply {
+                    put("msgIdx", r.msgIdx)
+                    put("sender", r.sender)
+                    put("title", r.title)
+                    put("body", r.body)
+                    put("dueDate", r.dueDate)
+                    put("isSyncedToCalendar", r.isSyncedToCalendar)
+                    put("recurrence", r.recurrence)
+                    put("alertEnabled", r.alertEnabled)
+                })
+            }
+            root.put("reminders", remArr)
+        }
+
+        if (selection.scheduled) {
+            val schArr = JSONArray()
+            for (s in snapshot.scheduled) {
+                schArr.put(JSONObject().apply {
+                    put("recipient", s.recipient)
+                    put("body", s.body)
+                    put("simId", s.simId)
+                    put("scheduledTime", s.scheduledTime)
+                    put("createdAt", s.createdAt)
+                })
+            }
+            root.put("scheduled", schArr)
+        }
+
+        if (selection.settings && settings != null) {
+            root.put("settings", settings)
+        }
+
+        return root.toString()
     }
 
     // Helper: Obtain Local IPv4 Network address
@@ -166,110 +367,371 @@ class P2PSyncEngine {
         return "127.0.0.1"
     }
 
-    // Server-Side hosting of DB backup
+    private fun hostingState(clientConnected: Boolean, sending: Boolean = false) =
+        SyncState.Hosting(hostIp, hostPort, hostCode, clientConnected, sending)
+
+    // --- Host side: bind a random port, authenticate one client, hold the connection open ---
     fun startHostServer(pin: String, repository: SmsRepository) {
         scope.launch {
             try {
-                stopHostServer() // Close existing
-                _syncState.value = SyncState.Syncing
+                stopHostServer() // close any prior session (also resets state to Idle)
+                stopped = false
+                authenticated = false
 
-                val code = normalizeCode(pin)
-                val port = 8243
-                val localIp = getLocalIpAddress()
+                hostCode = normalizeCode(pin)
+                hostIp = getLocalIpAddress()
+                val server = ServerSocket(0) // random OS-assigned port (conflict avoidance, not security)
+                serverSocket = server
+                hostPort = server.localPort
+                _syncState.value = hostingState(clientConnected = false)
 
-                serverSocket = ServerSocket(port)
-                _syncState.value = SyncState.Hosting(localIp, port, code)
+                // Idle auto-stop: if nobody authenticates in time, shut the server down.
+                idleJob = scope.launch {
+                    delay(HOST_IDLE_TIMEOUT_MS)
+                    if (!authenticated && !stopped) {
+                        _syncState.value = SyncState.Error("No device connected in time")
+                        teardown()
+                    }
+                }
 
                 while (true) {
-                    val socket = serverSocket?.accept() ?: break
-                    _syncState.value = SyncState.Syncing
-
-                    // Handle single sync transaction in a new context
-                    handleSyncTransaction(socket, code, repository)
+                    val socket = server.accept() ?: break
+                    // Single client at a time: close any extra connection while one is held.
+                    if (activeSocket != null) {
+                        try { socket.close() } catch (e: Exception) {}
+                        continue
+                    }
+                    handleConnection(socket, hostCode)
                 }
             } catch (e: Exception) {
-                _syncState.value = SyncState.Error("Server error: ${e.localizedMessage}")
+                if (!stopped) _syncState.value = SyncState.Error("Server error: ${e.localizedMessage}")
             }
         }
     }
 
-    private suspend fun handleSyncTransaction(socket: Socket, code: String, repository: SmsRepository) {
-        withContext(Dispatchers.IO) {
-            var reader: BufferedReader? = null
-            var writer: PrintWriter? = null
-            try {
-                socket.soTimeout = SOCKET_TIMEOUT_MS
-                reader = BufferedReader(InputStreamReader(socket.getInputStream()))
-                writer = PrintWriter(socket.getOutputStream(), true)
+    // Authenticate one client, ACK immediately, then hold the socket open for the later payload push.
+    private suspend fun handleConnection(socket: Socket, code: String) = withContext(Dispatchers.IO) {
+        val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+        val writer = PrintWriter(socket.getOutputStream(), true)
+        try {
+            socket.soTimeout = SOCKET_TIMEOUT_MS
 
-                // 0. Generate a per-session salt and send it in the clear, then derive the key.
-                val salt = newSalt()
-                writer.println(Base64.encodeToString(salt, Base64.NO_WRAP))
-                val key = deriveKey(code, salt)
+            // 0. Per-session salt in the clear, then derive the key.
+            val salt = newSalt()
+            writer.println(Base64.encodeToString(salt, Base64.NO_WRAP))
+            val key = deriveKey(code, salt)
 
-                // 1. Read the client's authenticated greeting. A wrong code gives a wrong key,
-                //    so GCM tag verification (decrypt) throws and we reject the connection.
-                val clientMessage = readBoundedLine(reader, MAX_HANDSHAKE_LINE)
-                if (clientMessage == null) {
-                    _syncState.value = SyncState.Error("Handshake aborted by client")
-                    return@withContext
-                }
-
-                val authenticated = try {
-                    decrypt(clientMessage, key) == "HELLO_SYNC"
-                } catch (e: Exception) {
-                    false
-                }
-                if (!authenticated) {
-                    try { writer.println(encrypt("DENIED", key)) } catch (e: Exception) {}
-                    _syncState.value = SyncState.Error("Connection rejected: invalid pairing code")
-                    return@withContext
-                }
-
-                // 2. Load and serialize data list
-                val messages = repository.allMessages.first()
-                val jsonArr = JSONArray()
-                for (m in messages) {
-                    val obj = JSONObject()
-                    obj.put("sender", m.sender)
-                    obj.put("body", m.body)
-                    obj.put("timestamp", m.timestamp)
-                    obj.put("category", m.category)
-                    obj.put("simId", m.simId)
-                    jsonArr.put(obj)
-                }
-
-                // Encrypt payload and send
-                val serializedPayload = jsonArr.toString()
-                val encryptedPayload = encrypt(serializedPayload, key)
-
-                writer.println(encrypt("ACCEPT_SYNC", key))
-                writer.println(encryptedPayload)
-
-                _syncState.value = SyncState.Completed(0, messages.size)
-            } catch (e: Exception) {
-                _syncState.value = SyncState.Error("Sync exchange failed: ${e.localizedMessage}")
-            } finally {
-                try { reader?.close() } catch (ex: Exception) {}
-                try { writer?.close() } catch (ex: Exception) {}
-                try { socket.close() } catch (ex: Exception) {}
+            // 1. Authenticated greeting. Wrong code → wrong key → decrypt throws → reject, keep listening.
+            val clientMessage = readBoundedLine(reader, MAX_HANDSHAKE_LINE)
+            if (clientMessage == null) {
+                try { socket.close() } catch (e: Exception) {}
+                return@withContext
             }
+            val ok = try { decrypt(clientMessage, key) == MSG_HELLO } catch (e: Exception) { false }
+            if (!ok) {
+                try { writer.println(encrypt(MSG_DENIED, key)) } catch (e: Exception) {}
+                try { socket.close() } catch (e: Exception) {}
+                return@withContext // idle timer still active; wait for the right peer
+            }
+
+            // 2. Authenticated: acknowledge NOW, cancel the idle timer, and hold the connection open.
+            authenticated = true
+            idleJob?.cancel(); idleJob = null
+            writer.println(encrypt(MSG_ACCEPT, key))
+
+            socket.soTimeout = 0 // held open indefinitely; the user can Stop, or send when ready
+            activeSocket = socket
+            activeWriter = writer
+            activeKey = key
+            _syncState.value = hostingState(clientConnected = true)
+
+            // Watch for a peer drop: a blocking read returns -1 (EOF) or throws when it disconnects.
+            dropJob = scope.launch(Dispatchers.IO) {
+                try {
+                    while (isActive) {
+                        val c = reader.read()
+                        if (c == -1) { onPeerDropped(); break }
+                        // A well-behaved client sends nothing after HELLO; ignore stray bytes.
+                    }
+                } catch (e: Exception) {
+                    onPeerDropped()
+                }
+            }
+        } catch (e: Exception) {
+            try { socket.close() } catch (ex: Exception) {} // pre-auth transport error; keep listening
         }
+    }
+
+    // Peer disconnected before we pushed a payload → drop the held socket and wait for a new device.
+    private fun onPeerDropped() {
+        if (stopped || activeSocket == null) return // our own teardown, or nothing held
+        try { activeSocket?.close() } catch (e: Exception) {}
+        activeSocket = null
+        activeWriter = null
+        activeKey = null
+        _syncState.value = hostingState(clientConnected = false)
+    }
+
+    /**
+     * Push the chosen payload over the held connection, then tear the session down (one payload
+     * per session). Called from the ViewModel when the sender picks Full or a selective set.
+     */
+    suspend fun sendToConnectedClient(
+        selection: SyncSelection,
+        syncMode: String,
+        repository: SmsRepository,
+        context: Context
+    ) = withContext(Dispatchers.IO) {
+        val writer = activeWriter
+        val key = activeKey
+        if (writer == null || key == null) {
+            _syncState.value = SyncState.Error("The other device is no longer connected")
+            teardown() // no live client; close the server so nothing dangles
+            return@withContext
+        }
+        try {
+            _syncState.value = hostingState(clientConnected = true, sending = true)
+            val snapshot = repository.collectSyncData()
+            val settings = if (selection.settings) SyncSettings.collect(context) else null
+            val payload = buildSyncPayload(snapshot, selection, syncMode, settings)
+            writer.println(encrypt(payload, key))
+            val exported = if (selection.includesMessages) snapshot.messages.size else 0
+            _syncState.value = SyncState.Completed(importedCount = 0, exportedCount = exported)
+        } catch (e: Exception) {
+            _syncState.value = SyncState.Error("Sync send failed: ${e.localizedMessage}")
+        } finally {
+            teardown() // closes sockets/jobs but leaves the Completed/Error state in place
+        }
+    }
+
+    // Close sockets + cancel jobs without touching the visible state (so a Completed/Error sticks).
+    private fun teardown() {
+        stopped = true
+        idleJob?.cancel(); idleJob = null
+        dropJob?.cancel(); dropJob = null
+        try { activeSocket?.close() } catch (e: Exception) {}
+        activeSocket = null
+        activeWriter = null
+        activeKey = null
+        val server = serverSocket
+        serverSocket = null
+        if (server != null) { try { server.close() } catch (e: Exception) {} }
+        authenticated = false
     }
 
     fun stopHostServer() {
-        try {
-            serverSocket?.close()
-        } catch (e: Exception) {
-            // ignore
-        } finally {
-            serverSocket = null
-            _syncState.value = SyncState.Idle
-        }
+        teardown()
+        _syncState.value = SyncState.Idle
     }
 
-    // Client-Side connection and merging
-    fun connectAndSync(hostIp: String, pin: String, repository: SmsRepository) {
+    /**
+     * Parse and apply a v:3 payload on the client, **add-only (client-wins)**: any record the
+     * receiver already has (matched on a stable natural key) is skipped, never overwritten.
+     * Messages are imported first so their new local row ids can re-link finance/reminder rows;
+     * finance/reminders are only imported for a message that was newly added (a message the
+     * receiver already had keeps its own derived rows). The peer is untrusted even after
+     * authentication, so every array is size-capped and every field is validated. On any
+     * validation failure this sets an Error state and returns null; otherwise it returns the
+     * add-only tally.
+     */
+    private suspend fun importSyncPayload(
+        payload: String,
+        repository: SmsRepository,
+        appContext: Context
+    ): `in`.sreerajp.sms_sentry.data.MergeCounts? {
+        val root = try {
+            JSONObject(payload)
+        } catch (e: Exception) {
+            _syncState.value = SyncState.Error("Malformed sync payload from host")
+            return null
+        }
+
+        val version = root.optInt("v", 1)
+        if (version != PAYLOAD_VERSION) {
+            _syncState.value = SyncState.Error("Incompatible sync version $version — update both phones to the same build")
+            return null
+        }
+        val syncMode = root.optString("syncMode", SYNC_MODE_INCREMENTAL)
+
+        var added = 0
+        var skipped = 0
+
+        // 1. Messages first — record each message's local row id and whether it was newly added.
+        val msgArr = root.optJSONArray("messages") ?: JSONArray()
+        if (msgArr.length() > MAX_MESSAGES) {
+            _syncState.value = SyncState.Error("Payload too large: ${msgArr.length()} messages exceeds limit")
+            return null
+        }
+        val localIds = LongArray(msgArr.length())
+        val wasAdded = BooleanArray(msgArr.length())
+        for (i in 0 until msgArr.length()) {
+            val obj = msgArr.getJSONObject(i)
+            val sender = obj.optString("sender")
+            val body = obj.optString("body")
+            val timestamp = obj.optLong("timestamp")
+            if (sender.length > MAX_FIELD_LEN || body.length > MAX_FIELD_LEN) {
+                _syncState.value = SyncState.Error("Rejected oversized message field from host")
+                return null
+            }
+            if (timestamp <= 0L) {
+                _syncState.value = SyncState.Error("Rejected message with invalid timestamp from host")
+                return null
+            }
+            val result = repository.importSyncedMessage(
+                SyncMessage(
+                    sender = sender,
+                    body = body,
+                    timestamp = timestamp,
+                    category = obj.optString("category", "Others"),
+                    simId = obj.optInt("simId", 1),
+                    isBlocked = obj.optBoolean("isBlocked", false),
+                    isRead = obj.optBoolean("isRead", false),
+                    type = obj.optInt("type", SMSMessage.TYPE_INBOX),
+                    isMms = obj.optBoolean("isMms", false),
+                    status = obj.optInt("status", SMSMessage.STATUS_NONE)
+                )
+            )
+            localIds[i] = result.id
+            wasAdded[i] = result.added
+            if (result.added) added++ else skipped++
+        }
+
+        // 2. Filter rules — add-only.
+        val ruleArr = root.optJSONArray("rules") ?: JSONArray()
+        if (ruleArr.length() > MAX_RULES) {
+            _syncState.value = SyncState.Error("Payload too large: too many filter rules")
+            return null
+        }
+        val rules = ArrayList<SyncRule>(ruleArr.length())
+        for (i in 0 until ruleArr.length()) {
+            val obj = ruleArr.getJSONObject(i)
+            val type = obj.optString("type")
+            val value = obj.optString("value")
+            val target = obj.optString("targetCategory")
+            if (type.length > MAX_FIELD_LEN || value.length > MAX_FIELD_LEN || target.length > MAX_FIELD_LEN) {
+                _syncState.value = SyncState.Error("Rejected oversized rule field from host")
+                return null
+            }
+            rules.add(SyncRule(type, value, target))
+        }
+        val ruleCounts = repository.importSyncedRules(rules)
+        added += ruleCounts.added
+        skipped += ruleCounts.skipped
+
+        // 3. Finance rows — imported only for a message that was newly added (add-only), re-linked by index.
+        val finArr = root.optJSONArray("finance") ?: JSONArray()
+        if (finArr.length() > MAX_FINANCE) {
+            _syncState.value = SyncState.Error("Payload too large: too many finance rows")
+            return null
+        }
+        for (i in 0 until finArr.length()) {
+            val obj = finArr.getJSONObject(i)
+            val msgIdx = obj.optInt("msgIdx", -1)
+            if (msgIdx !in localIds.indices || !wasAdded[msgIdx]) continue
+            val amount = obj.optDouble("amount", 0.0)
+            val balance = obj.optDouble("balance", 0.0)
+            if (!amount.isFinite() || !balance.isFinite()) {
+                _syncState.value = SyncState.Error("Rejected finance row with invalid number")
+                return null
+            }
+            val bank = obj.optString("bankName", "Unknown Bk")
+            if (bank.length > MAX_FIELD_LEN) {
+                _syncState.value = SyncState.Error("Rejected oversized finance field from host")
+                return null
+            }
+            repository.insertSyncedFinance(
+                localIds[msgIdx],
+                SyncFinance(msgIdx, bank, amount, obj.optBoolean("isCredit", false), balance, obj.optLong("timestamp"))
+            )
+            added++
+        }
+
+        // 4. Reminders — imported only for a newly-added message, re-linked by index.
+        val remArr = root.optJSONArray("reminders") ?: JSONArray()
+        if (remArr.length() > MAX_REMINDERS) {
+            _syncState.value = SyncState.Error("Payload too large: too many reminders")
+            return null
+        }
+        for (i in 0 until remArr.length()) {
+            val obj = remArr.getJSONObject(i)
+            val msgIdx = obj.optInt("msgIdx", -1)
+            if (msgIdx !in localIds.indices || !wasAdded[msgIdx]) continue
+            val sender = obj.optString("sender")
+            val title = obj.optString("title", "SMS Reminder")
+            val body = obj.optString("body")
+            if (sender.length > MAX_FIELD_LEN || title.length > MAX_FIELD_LEN || body.length > MAX_FIELD_LEN) {
+                _syncState.value = SyncState.Error("Rejected oversized reminder field from host")
+                return null
+            }
+            repository.insertSyncedReminder(
+                localIds[msgIdx],
+                SyncReminder(
+                    msgIdx = msgIdx,
+                    sender = sender,
+                    title = title,
+                    body = body,
+                    dueDate = obj.optLong("dueDate"),
+                    isSyncedToCalendar = obj.optBoolean("isSyncedToCalendar", false),
+                    recurrence = obj.optString("recurrence", "NONE"),
+                    alertEnabled = obj.optBoolean("alertEnabled", true)
+                )
+            )
+            added++
+        }
+
+        // 5. Scheduled (future-send) messages — add-only on (recipient, body, scheduledTime); re-arm the alarm.
+        val schArr = root.optJSONArray("scheduled") ?: JSONArray()
+        if (schArr.length() > MAX_SCHEDULED) {
+            _syncState.value = SyncState.Error("Payload too large: too many scheduled messages")
+            return null
+        }
+        val existingScheduled = repository.getAllScheduledOnce()
+            .mapTo(HashSet()) { Triple(it.recipient, it.body, it.scheduledTime) }
+        val canArm = ScheduledSmsScheduler.canScheduleExact(appContext)
+        val now = System.currentTimeMillis()
+        for (i in 0 until schArr.length()) {
+            val obj = schArr.getJSONObject(i)
+            val recipient = obj.optString("recipient")
+            val body = obj.optString("body")
+            if (recipient.length > MAX_FIELD_LEN || body.length > MAX_FIELD_LEN) {
+                _syncState.value = SyncState.Error("Rejected oversized scheduled field from host")
+                return null
+            }
+            val scheduledTime = obj.optLong("scheduledTime")
+            val key = Triple(recipient, body, scheduledTime)
+            if (key in existingScheduled) {
+                skipped++
+                continue
+            }
+            val id = repository.insertScheduled(
+                ScheduledSms(
+                    recipient = recipient,
+                    body = body,
+                    simId = obj.optInt("simId", 1),
+                    scheduledTime = scheduledTime,
+                    createdAt = obj.optLong("createdAt", now)
+                )
+            )
+            existingScheduled.add(key)
+            added++
+            // Only arm a future send; a past scheduledTime is imported as a record but not fired.
+            if (canArm && scheduledTime > now) {
+                ScheduledSmsScheduler.schedule(appContext, id, scheduledTime)
+            }
+        }
+
+        // 6. Settings — allow-listed only; overwrite on a full sync, fill-only on incremental.
+        val settingsObj = root.optJSONObject("settings")
+        if (settingsObj != null) {
+            SyncSettings.apply(appContext, settingsObj, overwrite = syncMode == SYNC_MODE_FULL)
+        }
+
+        return `in`.sreerajp.sms_sentry.data.MergeCounts(added, skipped)
+    }
+
+    // Client-Side connection and add-only merge. `appContext` is used to apply settings and to
+    // re-arm alarms for any synced scheduled (future-send) messages on this device.
+    fun connectAndSync(hostIp: String, port: Int, pin: String, repository: SmsRepository, appContext: Context) {
         scope.launch {
             _syncState.value = SyncState.Connecting
             var socket: Socket? = null
@@ -280,7 +742,7 @@ class P2PSyncEngine {
                 val code = normalizeCode(pin)
                 socket = Socket()
                 val address = InetAddress.getByName(hostIp)
-                socket.connect(java.net.InetSocketAddress(address, 8243), 6000) // 6s timeout
+                socket.connect(java.net.InetSocketAddress(address, port), 6000) // 6s connect timeout
                 socket.soTimeout = SOCKET_TIMEOUT_MS
 
                 writer = PrintWriter(socket.getOutputStream(), true)
@@ -295,33 +757,30 @@ class P2PSyncEngine {
                 val key = deriveKey(code, Base64.decode(saltLine, Base64.NO_WRAP))
 
                 // Step 1: Send the authenticated greeting (proves code knowledge via the GCM key).
-                writer.println(encrypt("HELLO_SYNC", key))
+                writer.println(encrypt(MSG_HELLO, key))
 
                 // Step 2: Read accept answer. A wrong code means decrypt() throws (tag mismatch).
-                val rawChallengeText = readBoundedLine(reader, MAX_HANDSHAKE_LINE)
-                if (rawChallengeText == null) {
+                val ans = readBoundedLine(reader, MAX_HANDSHAKE_LINE)
+                if (ans == null) {
                     _syncState.value = SyncState.Error("Host closed connection immediately")
                     return@launch
                 }
-
-                val accepted = try {
-                    decrypt(rawChallengeText, key) == "ACCEPT_SYNC"
-                } catch (e: Exception) {
-                    false
-                }
+                val accepted = try { decrypt(ans, key) == MSG_ACCEPT } catch (e: Exception) { false }
                 if (!accepted) {
                     _syncState.value = SyncState.Error("Sync access denied: incorrect pairing code")
                     return@launch
                 }
 
-                // Step 3: Parse Payload
-                _syncState.value = SyncState.Syncing
+                // Step 3: Connected — the sender is choosing what to share. Wait (long timeout) for the payload.
+                _syncState.value = SyncState.WaitingForSender
+                socket.soTimeout = PAYLOAD_WAIT_MS
                 val encryptedPayload = readBoundedLine(reader, MAX_PAYLOAD_LINE)
                 if (encryptedPayload == null) {
-                    _syncState.value = SyncState.Error("Empty payload received from host")
+                    _syncState.value = SyncState.Error("The other device closed the connection")
                     return@launch
                 }
 
+                _syncState.value = SyncState.Syncing
                 val decryptedPayload = try {
                     decrypt(encryptedPayload, key)
                 } catch (e: Exception) {
@@ -329,36 +788,15 @@ class P2PSyncEngine {
                     return@launch
                 }
 
-                val jsonArr = JSONArray(decryptedPayload)
-                if (jsonArr.length() > MAX_MESSAGES) {
-                    _syncState.value = SyncState.Error("Payload too large: ${jsonArr.length()} messages exceeds limit")
-                    return@launch
-                }
-                var countMerged = 0
+                val counts = importSyncPayload(decryptedPayload, repository, appContext)
+                    ?: return@launch // importSyncPayload already set an Error state
 
-                // Import messages incrementally via Repository (runs Classifiers to categorize and
-                // update financial state!). The peer is untrusted: validate every field before use.
-                for (i in 0 until jsonArr.length()) {
-                    val obj = jsonArr.getJSONObject(i)
-                    val sender = obj.getString("sender")
-                    val body = obj.getString("body")
-                    val timestamp = obj.getLong("timestamp")
-                    val simId = obj.getInt("simId")
-
-                    if (sender.length > MAX_FIELD_LEN || body.length > MAX_FIELD_LEN) {
-                        _syncState.value = SyncState.Error("Rejected oversized message field from host")
-                        return@launch
-                    }
-                    if (timestamp <= 0L) {
-                        _syncState.value = SyncState.Error("Rejected message with invalid timestamp from host")
-                        return@launch
-                    }
-
-                    repository.processAndInsertMessage(sender, body, timestamp, simId)
-                    countMerged++
-                }
-
-                _syncState.value = SyncState.Completed(countMerged, 0)
+                _syncState.value = SyncState.Completed(
+                    importedCount = counts.added,
+                    exportedCount = 0,
+                    addedCount = counts.added,
+                    skippedCount = counts.skipped
+                )
             } catch (e: Exception) {
                 _syncState.value = SyncState.Error("Sync failure: ${e.localizedMessage}")
             } finally {

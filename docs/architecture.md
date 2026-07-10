@@ -102,18 +102,65 @@ directly.
   That high entropy is what makes the scheme secure without a PAKE: an eavesdropper who captures
   the whole handshake cannot brute-force the code offline, an active MITM cannot establish a
   session without it, and because the code is per-session there is no long-term key to compromise
-  (effective forward secrecy). Handshake: host sends the salt in the clear, then the client
-  sends a GCM-encrypted `HELLO_SYNC` — a wrong code yields a wrong key, so GCM tag verification
-  fails and the connection is rejected (no plaintext comparison, **no** fallback cipher). Each
-  message is `Base64.NO_WRAP(IV ‖ ciphertext+tag)`. Robustness: line reads are bounded
-  (`readBoundedLine`, 4 KB handshake / 64 MB payload) and the socket has a 30 s read timeout to
-  resist OOM/DoS; imported JSON is validated (message-count cap, per-field size cap, positive
-  timestamp) before the untrusted peer's data reaches `processAndInsertMessage`. The transport
-  is still a plaintext `ServerSocket` on **port 8243** (no TLS) — the *payload*, not the socket,
-  is authenticated-encrypted, which is sufficient given the code never crosses the wire. The host
-  serializes its messages to JSON and sends them; the client re-runs them through
-  `processAndInsertMessage` (re-classifying on import). This is a breaking wire-protocol change:
-  both devices must run this build to sync.
+  (effective forward secrecy). The KDF is **PBKDF2-HMAC-SHA256, 300k iterations**. Handshake
+  (**connect-then-choose**): host sends the salt in the clear, then the client sends a
+  GCM-encrypted `HELLO_SYNC` — a wrong code yields a wrong key, so GCM tag verification fails and
+  the connection is rejected (no plaintext comparison, **no** fallback cipher). On success the
+  host replies `ACCEPT_SYNC` **immediately** and **holds the connection open**; it pushes the
+  chosen payload later, when the sender picks what to share. Each message is
+  `Base64.NO_WRAP(IV ‖ ciphertext+tag)` (`decrypt` guards a too-short ciphertext). Robustness /
+  hostile-peer hardening: line reads are bounded (`readBoundedLine`, 4 KB handshake / 64 MB
+  payload); the handshake has a 30 s read timeout while the held-open payload read on the client
+  waits up to 10 min; the host **idle-auto-stops** after 120 s with no authenticated peer, serves
+  a **single client** at a time, detects a peer drop while held open, and tears down after **one
+  payload per session**; the imported payload is validated (per-array size caps, per-field size
+  cap, positive timestamps, finite numbers, bounds-checked message indexes) before the untrusted
+  peer's data is written. The transport is a plaintext `ServerSocket` on a **random OS-assigned
+  port** (no TLS) — the *payload*, not the socket, is authenticated-encrypted, which is sufficient
+  given the code never crosses the wire.
+- **P2P sync is one-way, connect-then-choose, add-only (client-wins):** once a peer is connected
+  the **sender chooses** a **Full Sync** or a selective set of categories, and the receiver
+  **keeps its own data** — any record it already has (matched on a stable natural key) is
+  **skipped, never overwritten**. The client **preserves the host's classification instead of
+  re-classifying**. The wire payload is a versioned JSON object (`"v": 3` + `"syncMode"` of
+  `full`/`incremental`, see `PAYLOAD_VERSION` / `buildSyncPayload` / `importSyncPayload` in
+  [P2PSyncEngine.kt](../app/src/main/java/in/sreerajp/sms_sentry/engine/P2PSyncEngine.kt)); a
+  category key is present **only when selected**, so the receiver can tell "0 sent" from "not
+  included". Tables:
+  - `messages` — `sender`, `body`, `timestamp`, `category`, `simId`, `isBlocked`, `isRead`,
+    `type`, `isMms` (flag only), `status`.
+  - `rules` (`FilterRule`), `finance` (`FinanceTx`), `reminders` (`ReminderSms`, including
+    `recurrence` / `alertEnabled`), `scheduled` (`ScheduledSms`), and an allow-listed
+    `settings` object.
+  - `finance` / `reminders` link to their parent message by its **index** in `messages`
+    (`msgIdx`), so selecting either **implies messages are carried too**; the client inserts
+    messages first, then re-links, and imports a message's derived finance/reminder rows **only
+    when that message was newly added** (a message the receiver already had keeps its own derived
+    rows). Imported scheduled messages have their alarm re-armed on the client
+    (`ScheduledSmsScheduler`); reminder alarms re-arm through the ViewModel's reactive
+    `ReminderAlarmScheduler.reconcile`.
+  - **Settings allow-list** (`SyncSettings`): only non-sensitive **behaviour** prefs are synced
+    (reminder alerts on/off, reminder lead-days, reminder near-days, reminder vibration,
+    auto-mark-read seconds) — **overwrite** on a Full sync, **fill-only** on an incremental one.
+    Theme, `default_sms_sim`, muted/paid sets, and drafts are intentionally excluded.
+  - **Device/provider-specific fields are intentionally NOT synced** (they cannot be replayed
+    on another phone): `SMSMessage.systemId` and `threadId` (ids in the host's
+    `content://sms|mms` provider) and `attachmentUri` / MMS media (host-local `content://`
+    URIs whose blobs never cross the text socket). These stay `null` on the client; the
+    `isMms` flag and text body still cross.
+  - Import is via dedicated repository helpers (`collectSyncData` / `importSyncedMessage` /
+    `importSyncedRules` / `insertSyncedFinance` / `insertSyncedReminder`) that keep all Room
+    writes inside `SmsRepository`; `importSyncedMessage` / `importSyncedRules` are **add-only**
+    and report an added/skipped tally surfaced in the completion summary. This is a breaking
+    wire-protocol + KDF change: both devices must run this build to sync.
+  - **QR pairing:** the host also renders a QR code
+    (`smssentry://sync?v=1&ip=…&port=…&code=…`, see
+    [SyncQr.kt](../app/src/main/java/in/sreerajp/sms_sentry/util/SyncQr.kt)) that the client
+    scans (`zxing-android-embedded`, `CAMERA` permission, `ScanContract`) to auto-fill the IP,
+    **port**, and code and connect; the parser requires the `v=1` marker so a foreign/older QR is
+    rejected. The QR is read visually off the host's screen, so the code is still out-of-band and
+    never crosses the socket — the security model is unchanged. Camera is declared optional;
+    typing the IP + port + code still works.
 - Accounts tab (the money ledger; internal names still `isFinance*`/`FinanceScreen`) is gated behind a
   device-auth lock (`isFinanceLocked` / `triggerDeviceAuthentication`). This lock is the "finance
   security": it survived the four-category consolidation because the ledger is a derived view over

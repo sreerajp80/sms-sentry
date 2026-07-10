@@ -40,12 +40,23 @@ class ReminderAlarmReceiver : BroadcastReceiver() {
 
                         SmsNotificationHelper.showReminderNotification(appContext, reminder)
 
-                        if (RecurrenceUtil.isRecurring(reminder.recurrence)) {
-                            val next = RecurrenceUtil.nextFutureOccurrence(
-                                reminder.dueDate, reminder.recurrence, System.currentTimeMillis()
-                            )
-                            repository.advanceReminderDueDate(reminderId, next)
-                            ReminderAlarmScheduler.schedule(appContext, reminderId, next)
+                        // Re-arm the next alert. Within the advance-notice window this is the next
+                        // daily tick; once the due-date alert has fired the window is exhausted
+                        // (nextTriggerAfter == null), at which point a recurring reminder rolls to
+                        // its next occurrence and a one-shot goes quiet (left for the expiry purge).
+                        val now = System.currentTimeMillis()
+                        val lead = ReminderAlarmScheduler.leadDays(appContext)
+                        var dueDate = reminder.dueDate
+                        var next = ReminderAlarmScheduler.nextTriggerAfter(dueDate, lead, now)
+                        if (next == null && RecurrenceUtil.isRecurring(reminder.recurrence)) {
+                            dueDate = RecurrenceUtil.nextFutureOccurrence(dueDate, reminder.recurrence, now)
+                            repository.advanceReminderDueDate(reminderId, dueDate)
+                            next = ReminderAlarmScheduler.nextTriggerAfter(dueDate, lead, now)
+                        }
+                        if (next != null) {
+                            ReminderAlarmScheduler.scheduleAt(appContext, reminderId, next)
+                        } else {
+                            ReminderAlarmScheduler.cancel(appContext, reminderId)
                         }
                     } catch (e: Exception) {
                         Log.e(TAG, "Error firing reminder id=$reminderId", e)

@@ -5,6 +5,70 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
 import java.util.*
 
+/**
+ * A device-independent snapshot of everything the P2P full-clone sync carries from a host to a
+ * fresh phone. Device/provider-specific columns (systemId / threadId / attachmentUri and MMS
+ * media) are deliberately excluded — they cannot be replayed on another device. Finance and
+ * reminder rows link to their parent message by its index in [messages] (row ids differ per
+ * phone), with `msgIdx = -1` for a reminder that has no parent message in the snapshot.
+ */
+data class SyncSnapshot(
+    val messages: List<SyncMessage>,
+    val rules: List<SyncRule>,
+    val finance: List<SyncFinance>,
+    val reminders: List<SyncReminder>,
+    val scheduled: List<SyncScheduled>
+)
+
+data class SyncMessage(
+    val sender: String,
+    val body: String,
+    val timestamp: Long,
+    val category: String,
+    val simId: Int,
+    val isBlocked: Boolean,
+    val isRead: Boolean,
+    val type: Int,
+    val isMms: Boolean,
+    val status: Int
+)
+
+data class SyncRule(val type: String, val value: String, val targetCategory: String)
+
+data class SyncFinance(
+    val msgIdx: Int,
+    val bankName: String,
+    val amount: Double,
+    val isCredit: Boolean,
+    val balance: Double,
+    val timestamp: Long
+)
+
+data class SyncReminder(
+    val msgIdx: Int,
+    val sender: String,
+    val title: String,
+    val body: String,
+    val dueDate: Long,
+    val isSyncedToCalendar: Boolean,
+    val recurrence: String,
+    val alertEnabled: Boolean
+)
+
+data class SyncScheduled(
+    val recipient: String,
+    val body: String,
+    val simId: Int,
+    val scheduledTime: Long,
+    val createdAt: Long
+)
+
+/** Result of add-only importing a single synced message: its local row id and whether it was new. */
+data class ImportedMsg(val id: Long, val added: Boolean)
+
+/** Add-only merge tally: rows newly inserted vs. rows skipped because the receiver already had them. */
+data class MergeCounts(val added: Int, val skipped: Int)
+
 class SmsRepository(private val smsDao: SmsDao) {
 
     // Streams
@@ -159,6 +223,134 @@ class SmsRepository(private val smsDao: SmsDao) {
             inserted++
         }
         return inserted
+    }
+
+    // --- P2P full-clone sync (host → fresh phone) ---
+
+    /**
+     * Read the whole database into a device-independent [SyncSnapshot] for the host side of the
+     * P2P sync. Finance and reminder rows are re-keyed from their local `messageId` onto the
+     * message's index in the snapshot so the client can re-link them to its own row ids.
+     */
+    suspend fun collectSyncData(): SyncSnapshot {
+        val messages = smsDao.getAllMessagesOnce()
+        val idxByMessageId = HashMap<Long, Int>(messages.size)
+        val syncMessages = messages.mapIndexed { idx, m ->
+            idxByMessageId[m.id] = idx
+            SyncMessage(
+                sender = m.sender,
+                body = m.body,
+                timestamp = m.timestamp,
+                category = m.category,
+                simId = m.simId,
+                isBlocked = m.isBlocked,
+                isRead = m.isRead,
+                type = m.type,
+                isMms = m.isMms,
+                status = m.status
+            )
+        }
+        val rules = smsDao.getAllRulesOnce().map { SyncRule(it.type, it.value, it.targetCategory) }
+        // Drop any finance row whose parent message is missing (shouldn't happen) — it can't be linked.
+        val finance = smsDao.getAllTransactionsOnce().mapNotNull { tx ->
+            val idx = idxByMessageId[tx.messageId] ?: return@mapNotNull null
+            SyncFinance(idx, tx.bankName, tx.amount, tx.isCredit, tx.balance, tx.timestamp)
+        }
+        val reminders = smsDao.getAllRemindersOnce().map { r ->
+            SyncReminder(
+                msgIdx = idxByMessageId[r.messageId] ?: -1,
+                sender = r.sender,
+                title = r.title,
+                body = r.body,
+                dueDate = r.dueDate,
+                isSyncedToCalendar = r.isSyncedToCalendar,
+                recurrence = r.recurrence,
+                alertEnabled = r.alertEnabled
+            )
+        }
+        val scheduled = smsDao.getAllScheduledOnce().map {
+            SyncScheduled(it.recipient, it.body, it.simId, it.scheduledTime, it.createdAt)
+        }
+        return SyncSnapshot(syncMessages, rules, finance, reminders, scheduled)
+    }
+
+    /**
+     * Add-only import of a synced message (client-wins): if an identical message
+     * (same sender/body/timestamp) already exists, it is **left untouched** and reported as
+     * skipped; otherwise a new row is inserted. The device-specific columns (systemId /
+     * threadId / attachmentUri) stay null — they belong to the host's SMS provider and cannot
+     * be replayed here. Callers import a message's derived finance/reminder rows only when it
+     * was newly added, so a message the receiver already had keeps its own derived rows.
+     */
+    suspend fun importSyncedMessage(m: SyncMessage): ImportedMsg {
+        val existing = smsDao.findMessageId(m.sender, m.body, m.timestamp)
+        if (existing != null) return ImportedMsg(existing, added = false)
+        val sms = SMSMessage(
+            sender = m.sender,
+            body = m.body,
+            timestamp = m.timestamp,
+            category = m.category,
+            simId = m.simId,
+            isBlocked = m.isBlocked,
+            isRead = m.isRead,
+            type = m.type,
+            isMms = m.isMms,
+            status = m.status
+        )
+        return ImportedMsg(smsDao.insertMessage(sms), added = true)
+    }
+
+    /**
+     * Add-only merge of synced filter rules (client-wins): a rule the receiver already has
+     * (matched on `(type, value)`) is skipped and keeps its own `targetCategory`; only genuinely
+     * new rules are inserted. Returns the added / skipped tally.
+     */
+    suspend fun importSyncedRules(rules: List<SyncRule>): MergeCounts {
+        if (rules.isEmpty()) return MergeCounts(0, 0)
+        val existing = smsDao.getAllRulesOnce().mapTo(HashSet()) { it.type to it.value }
+        var added = 0
+        var skipped = 0
+        for (r in rules) {
+            val key = r.type to r.value
+            if (key in existing) {
+                skipped++
+                continue
+            }
+            smsDao.insertRule(FilterRule(type = r.type, value = r.value, targetCategory = r.targetCategory))
+            existing.add(key)
+            added++
+        }
+        return MergeCounts(added, skipped)
+    }
+
+    /** Insert a synced finance row linked to the already-imported local message. */
+    suspend fun insertSyncedFinance(localMsgId: Long, f: SyncFinance) {
+        smsDao.insertTransaction(
+            FinanceTx(
+                messageId = localMsgId,
+                bankName = f.bankName,
+                amount = f.amount,
+                isCredit = f.isCredit,
+                balance = f.balance,
+                timestamp = f.timestamp
+            )
+        )
+    }
+
+    /** Insert a synced reminder (with its recurrence / alert settings) linked to a local message. */
+    suspend fun insertSyncedReminder(localMsgId: Long, r: SyncReminder) {
+        smsDao.insertReminder(
+            ReminderSms(
+                messageId = localMsgId,
+                sender = r.sender,
+                title = r.title,
+                body = r.body,
+                dueDate = r.dueDate,
+                isSyncedToCalendar = r.isSyncedToCalendar,
+                recurrence = r.recurrence,
+                alertEnabled = r.alertEnabled
+            )
+        )
     }
 
     // --- Message Management ---

@@ -23,6 +23,12 @@ object ReminderAlarmScheduler {
     /** SharedPreferences (the app's "theme_prefs") key for the global reminder-alert toggle. */
     const val PREF_ALERTS_ENABLED = "reminder_alerts_enabled"
 
+    /** SharedPreferences ("theme_prefs") key for the global advance-notice (lead) in days. */
+    const val PREF_LEAD_DAYS = "reminder_lead_days"
+
+    /** Default advance-notice window, in days, when the user hasn't set one. */
+    const val DEFAULT_LEAD_DAYS = 7
+
     /** Hour-of-day (local) used when a reminder's due timestamp is at midnight (date-only). */
     private const val DEFAULT_ALERT_HOUR = 9
 
@@ -37,6 +43,12 @@ object ReminderAlarmScheduler {
     fun alertsGloballyEnabled(context: Context): Boolean =
         context.getSharedPreferences("theme_prefs", Context.MODE_PRIVATE)
             .getBoolean(PREF_ALERTS_ENABLED, true)
+
+    /** Global advance-notice window in days (>= 0). 0 means alert only on the due date. */
+    fun leadDays(context: Context): Int =
+        context.getSharedPreferences("theme_prefs", Context.MODE_PRIVATE)
+            .getInt(PREF_LEAD_DAYS, DEFAULT_LEAD_DAYS)
+            .coerceAtLeast(0)
 
     /**
      * The wall-clock time the alert should fire for a reminder due at [dueDate]. Date-only due
@@ -54,12 +66,55 @@ object ReminderAlarmScheduler {
         return cal.timeInMillis
     }
 
-    /** Arm an exact alarm for [reminderId] firing at the trigger time derived from [dueDate]. */
+    /**
+     * The next alert time, strictly after [now], for the occurrence due at [dueDate] given a
+     * [leadDays] advance window; or null when the whole window (including the due date itself) is
+     * already in the past.
+     *
+     * The alert "days" are each day at [DEFAULT_ALERT_HOUR]:00 from `dueDate - leadDays` up to the
+     * day before the due date, plus [triggerTimeFor] (dueDate) on the due date itself (which keeps
+     * a specific time-of-day if the due date carries one). The earliest of these strictly after
+     * [now] is returned, so a window that opened in the past yields the next daily tick — i.e. the
+     * alerts "start that day". With [leadDays] == 0 the only candidate is the due-date trigger, so
+     * behavior is identical to a single due-date alarm.
+     */
+    fun nextTriggerAfter(dueDate: Long, leadDays: Int, now: Long): Long? {
+        val dueTrigger = triggerTimeFor(dueDate)
+        // Advance ticks: alert-hour on each day from (due day - leadDays) to (due day - 1).
+        if (leadDays > 0) {
+            val tick = Calendar.getInstance().apply {
+                timeInMillis = dueDate
+                add(Calendar.DAY_OF_YEAR, -leadDays)
+                set(Calendar.HOUR_OF_DAY, DEFAULT_ALERT_HOUR)
+                set(Calendar.MINUTE, 0)
+                set(Calendar.SECOND, 0)
+                set(Calendar.MILLISECOND, 0)
+            }
+            // Walk forward a day at a time until we pass `now` or reach the due day.
+            while (tick.timeInMillis <= now && tick.timeInMillis < dueTrigger) {
+                tick.add(Calendar.DAY_OF_YEAR, 1)
+            }
+            if (tick.timeInMillis > now && tick.timeInMillis < dueTrigger) {
+                return tick.timeInMillis
+            }
+        }
+        // No advance tick left before the due date — fall back to the due-date trigger itself.
+        return if (dueTrigger > now) dueTrigger else null
+    }
+
+    /** Arm an exact alarm for [reminderId] firing at the next trigger derived from [dueDate]. */
     fun schedule(context: Context, reminderId: Long, dueDate: Long) {
+        val triggerAt = nextTriggerAfter(dueDate, leadDays(context), System.currentTimeMillis())
+            ?: return
+        scheduleAt(context, reminderId, triggerAt)
+    }
+
+    /** Arm an exact alarm for [reminderId] at the explicit wall-clock time [triggerAtMillis]. */
+    fun scheduleAt(context: Context, reminderId: Long, triggerAtMillis: Long) {
         val am = context.getSystemService(AlarmManager::class.java) ?: return
         am.setExactAndAllowWhileIdle(
             AlarmManager.RTC_WAKEUP,
-            triggerTimeFor(dueDate),
+            triggerAtMillis,
             pendingIntent(context, reminderId, PendingIntent.FLAG_UPDATE_CURRENT)
         )
     }
@@ -78,10 +133,15 @@ object ReminderAlarmScheduler {
      */
     fun reconcile(context: Context, reminders: List<ReminderSms>) {
         val globallyOn = alertsGloballyEnabled(context) && canScheduleExact(context)
+        val lead = leadDays(context)
         val now = System.currentTimeMillis()
         for (r in reminders) {
-            val shouldArm = globallyOn && r.alertEnabled && triggerTimeFor(r.dueDate) > now
-            if (shouldArm) schedule(context, r.id, r.dueDate) else cancel(context, r.id)
+            val nextTrigger = if (globallyOn && r.alertEnabled) {
+                nextTriggerAfter(r.dueDate, lead, now)
+            } else {
+                null
+            }
+            if (nextTrigger != null) scheduleAt(context, r.id, nextTrigger) else cancel(context, r.id)
         }
     }
 

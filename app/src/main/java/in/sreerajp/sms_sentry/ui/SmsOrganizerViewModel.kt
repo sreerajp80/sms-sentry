@@ -16,6 +16,7 @@ import androidx.lifecycle.viewModelScope
 import `in`.sreerajp.sms_sentry.data.*
 import `in`.sreerajp.sms_sentry.engine.MmsParser
 import `in`.sreerajp.sms_sentry.engine.P2PSyncEngine
+import `in`.sreerajp.sms_sentry.engine.SyncSelection
 import `in`.sreerajp.sms_sentry.engine.SmsShareUtils
 import `in`.sreerajp.sms_sentry.engine.SyncState
 import `in`.sreerajp.sms_sentry.ui.theme.ThemeStyle
@@ -108,6 +109,24 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
     var reminderAlertsEnabled = persistedState(ReminderAlarmScheduler.PREF_ALERTS_ENABLED, true) {
         prefs.edit().putBoolean(ReminderAlarmScheduler.PREF_ALERTS_ENABLED, it).apply()
         ReminderAlarmScheduler.reconcile(getApplication(), reminders.value)
+    }
+
+    // Global advance-notice (lead) window in days, applied to every reminder. 0 = alert only on
+    // the due date. Changing it re-reconciles every reminder's alarm so the new window arms at once.
+    var reminderLeadDays = persistedState(ReminderAlarmScheduler.PREF_LEAD_DAYS, ReminderAlarmScheduler.DEFAULT_LEAD_DAYS) {
+        prefs.edit().putInt(ReminderAlarmScheduler.PREF_LEAD_DAYS, it).apply()
+        ReminderAlarmScheduler.reconcile(getApplication(), reminders.value)
+    }
+
+    // How many days out a reminder is highlighted as "due soon" in the Reminders list. UI-only.
+    var reminderNearDays = persistedState("reminder_near_days", 3) {
+        prefs.edit().putInt("reminder_near_days", it).apply()
+    }
+
+    // Whether reminder due-alerts vibrate. Default off; read at notification-post time, so the
+    // setter only needs to persist (no reconcile).
+    var reminderVibrationEnabled = persistedState(SmsNotificationHelper.PREF_REMINDER_VIBRATION, false) {
+        prefs.edit().putBoolean(SmsNotificationHelper.PREF_REMINDER_VIBRATION, it).apply()
     }
 
     // Muted senders (notifications suppressed) — persisted to theme_prefs as a string set.
@@ -801,8 +820,32 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
         syncEngine.startHostServer(pin, repository)
     }
 
-    fun joinSyncServer(ip: String, pin: String) {
-        syncEngine.connectAndSync(ip, pin, repository)
+    fun joinSyncServer(ip: String, port: Int, pin: String) {
+        syncEngine.connectAndSync(ip, port, pin, repository, getApplication<Application>().applicationContext)
+    }
+
+    /** Host: push everything to a (fresh) peer — full clone, settings overwrite. */
+    fun sendFullSync() {
+        viewModelScope.launch {
+            syncEngine.sendToConnectedClient(
+                selection = SyncSelection.full(),
+                syncMode = P2PSyncEngine.SYNC_MODE_FULL,
+                repository = repository,
+                context = getApplication<Application>().applicationContext
+            )
+        }
+    }
+
+    /** Host: push only the chosen categories — add-only on the peer, settings fill-only. */
+    fun sendSelectiveSync(selection: SyncSelection) {
+        viewModelScope.launch {
+            syncEngine.sendToConnectedClient(
+                selection = selection,
+                syncMode = P2PSyncEngine.SYNC_MODE_INCREMENTAL,
+                repository = repository,
+                context = getApplication<Application>().applicationContext
+            )
+        }
     }
 
     fun stopHosting() {

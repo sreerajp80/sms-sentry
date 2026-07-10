@@ -1,7 +1,16 @@
 package `in`.sreerajp.sms_sentry
 
+import `in`.sreerajp.sms_sentry.data.SyncFinance
+import `in`.sreerajp.sms_sentry.data.SyncMessage
+import `in`.sreerajp.sms_sentry.data.SyncReminder
+import `in`.sreerajp.sms_sentry.data.SyncScheduled
+import `in`.sreerajp.sms_sentry.data.SyncRule
+import `in`.sreerajp.sms_sentry.data.SyncSnapshot
 import `in`.sreerajp.sms_sentry.engine.P2PSyncEngine
+import `in`.sreerajp.sms_sentry.engine.SyncSelection
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -96,6 +105,69 @@ class P2PSyncCryptoTest {
         // the same normalized secret as the host's raw code.
         assertEquals(raw, engine.normalizeCode(grouped.lowercase()))
         assertEquals(raw, engine.normalizeCode("  $grouped  "))
+    }
+
+    private fun sampleSnapshot() = SyncSnapshot(
+        messages = listOf(
+            SyncMessage("BANK", "debited 500", 1_000L, "Others", 1, false, true, 1, false, 0),
+            SyncMessage("MOM", "call me", 2_000L, "Personal", 2, false, false, 2, false, 0)
+        ),
+        rules = listOf(SyncRule("KEYWORD", "otp", "Personal")),
+        finance = listOf(SyncFinance(msgIdx = 0, bankName = "HDFC", amount = 500.0, isCredit = false, balance = 1234.5, timestamp = 1_000L)),
+        reminders = listOf(SyncReminder(msgIdx = 1, sender = "MOM", title = "Call", body = "call me", dueDate = 9_000L, isSyncedToCalendar = false, recurrence = "WEEKLY", alertEnabled = true)),
+        scheduled = listOf(SyncScheduled("999", "later", 1, 5_000L, 100L))
+    )
+
+    @Test
+    fun `buildSyncPayload emits a v3 full-sync object that round-trips with linked finance and reminders`() {
+        val root = JSONObject(
+            engine.buildSyncPayload(sampleSnapshot(), SyncSelection.full(), P2PSyncEngine.SYNC_MODE_FULL, null)
+        )
+
+        assertEquals(P2PSyncEngine.PAYLOAD_VERSION, root.getInt("v"))
+        assertEquals(P2PSyncEngine.SYNC_MODE_FULL, root.getString("syncMode"))
+        val messages = root.getJSONArray("messages")
+        assertEquals(2, messages.length())
+        assertEquals("BANK", messages.getJSONObject(0).getString("sender"))
+        assertTrue(messages.getJSONObject(0).getBoolean("isRead"))
+        // finance/reminder links reference the message index, not a device-specific row id.
+        assertEquals(0, root.getJSONArray("finance").getJSONObject(0).getInt("msgIdx"))
+        assertEquals("HDFC", root.getJSONArray("finance").getJSONObject(0).getString("bankName"))
+        assertEquals(1, root.getJSONArray("reminders").getJSONObject(0).getInt("msgIdx"))
+        assertEquals("WEEKLY", root.getJSONArray("reminders").getJSONObject(0).getString("recurrence"))
+        assertEquals("999", root.getJSONArray("scheduled").getJSONObject(0).getString("recipient"))
+        // Device-specific columns are never serialized.
+        assertFalse(messages.getJSONObject(0).has("systemId"))
+        assertFalse(messages.getJSONObject(0).has("attachmentUri"))
+    }
+
+    @Test
+    fun `buildSyncPayload omits unselected categories but keeps messages when finance is selected`() {
+        // Only finance selected: finance travels, messages ride along (they link by index),
+        // and everything else is absent so the receiver can tell "not included" from "0 sent".
+        val selection = SyncSelection(
+            messages = false, rules = false, finance = true,
+            reminders = false, scheduled = false, settings = false
+        )
+        val root = JSONObject(
+            engine.buildSyncPayload(sampleSnapshot(), selection, P2PSyncEngine.SYNC_MODE_INCREMENTAL, null)
+        )
+
+        assertEquals(P2PSyncEngine.SYNC_MODE_INCREMENTAL, root.getString("syncMode"))
+        assertTrue("finance selected -> messages must ride along", root.has("messages"))
+        assertTrue(root.has("finance"))
+        assertFalse(root.has("rules"))
+        assertFalse(root.has("reminders"))
+        assertFalse(root.has("scheduled"))
+        assertFalse(root.has("settings"))
+    }
+
+    @Test
+    fun `decrypt rejects a ciphertext shorter than the IV`() {
+        val key = engine.deriveKey(engine.generatePairingCode(), engine.newSalt())
+        // 4 raw bytes -> shorter than the 12-byte IV; must throw, not IndexOutOfBounds silently.
+        val tooShort = android.util.Base64.encodeToString(ByteArray(4), android.util.Base64.NO_WRAP)
+        assertThrows(Exception::class.java) { engine.decrypt(tooShort, key) }
     }
 
     @Test

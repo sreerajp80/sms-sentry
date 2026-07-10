@@ -23,9 +23,19 @@ object SmsNotificationHelper {
     private const val CHANNEL_NAME = "SMS Sentry Messages"
     private const val CHANNEL_DESC = "Receive categorized SMS notifications and OTP actions."
 
-    private const val REMINDER_CHANNEL_ID = "sms_sentry_reminders"
-    private const val REMINDER_CHANNEL_NAME = "Reminder Alerts"
+    // Reminder due-alerts. Vibration on a NotificationChannel is immutable once created, so we keep
+    // two channels that differ only in vibration and post to whichever matches the user's setting.
+    private const val REMINDER_CHANNEL_NOVIB_ID = "sms_sentry_reminders_novib"
+    private const val REMINDER_CHANNEL_VIB_ID = "sms_sentry_reminders_vibrate"
+    private const val REMINDER_CHANNEL_NOVIB_NAME = "Reminder Alerts"
+    private const val REMINDER_CHANNEL_VIB_NAME = "Reminder Alerts (Vibration)"
     private const val REMINDER_CHANNEL_DESC = "Due-date alerts for reminders."
+
+    /** Legacy single reminder channel (always vibrated); retired in favor of the two above. */
+    private const val REMINDER_CHANNEL_LEGACY_ID = "sms_sentry_reminders"
+
+    /** SharedPreferences ("theme_prefs") key for the per-app reminder-vibration toggle (default off). */
+    const val PREF_REMINDER_VIBRATION = "reminder_vibration_enabled"
 
     /** Extra on the MainActivity launch intent telling the app to open the Reminders tab. */
     const val EXTRA_OPEN_REMINDERS = "in.sreerajp.sms_sentry.OPEN_REMINDERS"
@@ -361,15 +371,21 @@ object SmsNotificationHelper {
         val notificationManager =
             context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
+        val vibrationEnabled = context.getSharedPreferences("theme_prefs", Context.MODE_PRIVATE)
+            .getBoolean(PREF_REMINDER_VIBRATION, false)
+        val channelId = if (vibrationEnabled) REMINDER_CHANNEL_VIB_ID else REMINDER_CHANNEL_NOVIB_ID
+
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // Retire the legacy always-vibrating channel from upgraded installs (no-op otherwise).
+            notificationManager.deleteNotificationChannel(REMINDER_CHANNEL_LEGACY_ID)
             val channel = NotificationChannel(
-                REMINDER_CHANNEL_ID,
-                REMINDER_CHANNEL_NAME,
+                channelId,
+                if (vibrationEnabled) REMINDER_CHANNEL_VIB_NAME else REMINDER_CHANNEL_NOVIB_NAME,
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
                 description = REMINDER_CHANNEL_DESC
                 enableLights(true)
-                enableVibration(true)
+                enableVibration(vibrationEnabled)
             }
             notificationManager.createNotificationChannel(channel)
         }
@@ -410,7 +426,7 @@ object SmsNotificationHelper {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val builder = NotificationCompat.Builder(context, REMINDER_CHANNEL_ID)
+        val builder = NotificationCompat.Builder(context, channelId)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_REMINDER)
@@ -420,6 +436,11 @@ object SmsNotificationHelper {
             .setContentIntent(pendingContentIntent)
             .setAutoCancel(true)
             .addAction(0, "Done", pendingDoneIntent)
+
+        // Pre-O has no channels, so vibration is controlled on the notification itself.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            builder.setVibrate(if (vibrationEnabled) longArrayOf(0, 250, 250, 250) else longArrayOf(0L))
+        }
 
         notificationManager.notify(notificationId, builder.build())
     }

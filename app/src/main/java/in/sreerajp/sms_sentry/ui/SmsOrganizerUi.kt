@@ -34,6 +34,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
@@ -62,6 +63,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalDensity
@@ -76,6 +78,10 @@ import `in`.sreerajp.sms_sentry.data.ReminderSms
 import `in`.sreerajp.sms_sentry.data.SMSMessage
 import `in`.sreerajp.sms_sentry.engine.P2PSyncEngine
 import `in`.sreerajp.sms_sentry.engine.SyncState
+import `in`.sreerajp.sms_sentry.engine.SyncSelection
+import `in`.sreerajp.sms_sentry.util.SyncQr
+import com.journeyapps.barcodescanner.ScanContract
+import com.journeyapps.barcodescanner.ScanOptions
 import `in`.sreerajp.sms_sentry.ui.theme.ThemeStyle
 import `in`.sreerajp.sms_sentry.ui.theme.HighDensityBackgroundLight
 import `in`.sreerajp.sms_sentry.ui.theme.HighDensityBackgroundDark
@@ -3919,9 +3925,11 @@ fun RemindersScreen(viewModel: SmsOrganizerViewModel) {
                 modifier = Modifier.weight(1f),
                 verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
+                val nearDays by viewModel.reminderNearDays
                 items(reminders) { reminder ->
                     ReminderRowItem(
                         reminder = reminder,
+                        nearDays = nearDays,
                         onOpen = { viewModel.openMessageById(reminder.messageId) },
                         onAddToCalendar = { viewModel.addEventToCalendar(context, reminder) },
                         onDismiss = { viewModel.deleteReminder(reminder.id) },
@@ -3934,9 +3942,62 @@ fun RemindersScreen(viewModel: SmsOrganizerViewModel) {
     }
 }
 
+/**
+ * A label + description row with a numeric day-count control: a − button, a typeable numeric field
+ * (so the user can set any value), and a ＋ button. Values are clamped to [minValue].
+ */
+@Composable
+private fun ReminderDaysStepperRow(
+    title: String,
+    description: String,
+    value: Int,
+    minValue: Int,
+    onValueChange: (Int) -> Unit
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+            Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+            Text(
+                description,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
+            )
+        }
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(2.dp)
+        ) {
+            IconButton(
+                onClick = { onValueChange((value - 1).coerceAtLeast(minValue)) },
+                enabled = value > minValue
+            ) {
+                Icon(Icons.Default.Remove, contentDescription = "Decrease")
+            }
+            OutlinedTextField(
+                value = value.toString(),
+                onValueChange = { txt ->
+                    val digits = txt.filter { it.isDigit() }.take(4)
+                    onValueChange(digits.toIntOrNull()?.coerceAtLeast(minValue) ?: minValue)
+                },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+                modifier = Modifier.width(76.dp)
+            )
+            IconButton(onClick = { onValueChange(value + 1) }) {
+                Icon(Icons.Default.Add, contentDescription = "Increase")
+            }
+        }
+    }
+}
+
 @Composable
 fun ReminderRowItem(
     reminder: ReminderSms,
+    nearDays: Int,
     onOpen: () -> Unit,
     onAddToCalendar: () -> Unit,
     onDismiss: () -> Unit,
@@ -3947,14 +4008,42 @@ fun ReminderRowItem(
         val sdf = SimpleDateFormat("EEEE, dd MMMM yyyy", Locale.getDefault())
         sdf.format(Date(reminder.dueDate))
     }
+    // Whole days from the start of today to the reminder's due day (negative = overdue).
+    val daysRemaining = remember(reminder.dueDate) {
+        fun startOfDay(t: Long) = java.util.Calendar.getInstance().apply {
+            timeInMillis = t
+            set(java.util.Calendar.HOUR_OF_DAY, 0)
+            set(java.util.Calendar.MINUTE, 0)
+            set(java.util.Calendar.SECOND, 0)
+            set(java.util.Calendar.MILLISECOND, 0)
+        }.timeInMillis
+        ((startOfDay(reminder.dueDate) - startOfDay(System.currentTimeMillis())) / 86_400_000L).toInt()
+    }
+    val dueSoon = daysRemaining in 0..nearDays
+    val dueLabel = when {
+        daysRemaining < 0 -> "Overdue"
+        daysRemaining == 0 -> "Due today"
+        daysRemaining == 1 -> "Due tomorrow"
+        else -> "Due in $daysRemaining days"
+    }
     var recurrenceMenuOpen by remember { mutableStateOf(false) }
 
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .clickable { onOpen() },
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant),
+        colors = CardDefaults.cardColors(
+            containerColor = if (dueSoon) {
+                MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.4f)
+            } else {
+                MaterialTheme.colorScheme.surface
+            }
+        ),
+        border = if (dueSoon) {
+            BorderStroke(1.5.dp, MaterialTheme.colorScheme.error)
+        } else {
+            BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant)
+        },
         shape = RoundedCornerShape(16.dp)
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
@@ -3978,16 +4067,31 @@ fun ReminderRowItem(
                     )
                 }
 
-                if (reminder.isSyncedToCalendar) {
-                    AssistChip(
-                        onClick = {},
-                        label = { Text("Calendar Synced", fontSize = 10.sp) },
-                        leadingIcon = { Icon(imageVector = Icons.Default.Check, contentDescription = "Synced", modifier = Modifier.size(12.dp)) },
-                        colors = AssistChipDefaults.assistChipColors(
-                            containerColor = goodSoftColor(),
-                            labelColor = goodColor()
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (daysRemaining <= nearDays) {
+                        AssistChip(
+                            onClick = {},
+                            label = { Text(dueLabel, fontSize = 10.sp, fontWeight = FontWeight.Bold) },
+                            colors = AssistChipDefaults.assistChipColors(
+                                containerColor = MaterialTheme.colorScheme.error,
+                                labelColor = MaterialTheme.colorScheme.onError
+                            )
                         )
-                    )
+                    }
+                    if (reminder.isSyncedToCalendar) {
+                        AssistChip(
+                            onClick = {},
+                            label = { Text("Calendar Synced", fontSize = 10.sp) },
+                            leadingIcon = { Icon(imageVector = Icons.Default.Check, contentDescription = "Synced", modifier = Modifier.size(12.dp)) },
+                            colors = AssistChipDefaults.assistChipColors(
+                                containerColor = goodSoftColor(),
+                                labelColor = goodColor()
+                            )
+                        )
+                    }
                 }
             }
 
@@ -4098,6 +4202,20 @@ fun ReminderRowItem(
 private fun formatPairingCode(raw: String): String =
     raw.chunked(P2PSyncEngine.PAIRING_CODE_GROUP).joinToString("-")
 
+// A single labelled checkbox row for the host's "choose what to share" selection.
+@Composable
+private fun SyncCheckRow(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onChange(!checked) },
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Checkbox(checked = checked, onCheckedChange = onChange)
+        Text(label, fontSize = 13.sp)
+    }
+}
+
 @Composable
 fun SyncScreen(viewModel: SmsOrganizerViewModel) {
     val syncState by viewModel.syncState.collectAsState()
@@ -4108,9 +4226,33 @@ fun SyncScreen(viewModel: SmsOrganizerViewModel) {
     var showJoinPanel by remember { mutableStateOf(false) }
 
     var ipInput by remember { mutableStateOf("") }
+    var portInput by remember { mutableStateOf("") }
     var pinValue by remember { mutableStateOf("") }
 
+    // Host "choose what to share" selection (used once a peer is connected).
+    var selMessages by remember { mutableStateOf(true) }
+    var selRules by remember { mutableStateOf(false) }
+    var selFinance by remember { mutableStateOf(false) }
+    var selReminders by remember { mutableStateOf(false) }
+    var selScheduled by remember { mutableStateOf(false) }
+    var selSettings by remember { mutableStateOf(false) }
+
     val localIp = remember { viewModel.getLocalIp() }
+
+    // Scans the host's pairing QR; on a valid Sentry code, fill the fields and connect at once.
+    val qrScanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
+        val contents = result.contents ?: return@rememberLauncherForActivityResult // cancelled
+        val data = SyncQr.parseSyncQrContent(contents)
+        if (data == null) {
+            Toast.makeText(context, "Not a Sentry sync code", Toast.LENGTH_SHORT).show()
+        } else {
+            ipInput = data.ip
+            portInput = data.port.toString()
+            pinValue = data.code
+            viewModel.joinSyncServer(data.ip, data.port, data.code)
+            showJoinPanel = false
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -4166,38 +4308,137 @@ fun SyncScreen(viewModel: SmsOrganizerViewModel) {
                         }
                     }
                     is SyncState.Hosting -> {
+                        // Live status chip: waiting vs. a peer connected.
                         Row(verticalAlignment = Alignment.CenterVertically) {
-                            Box(modifier = Modifier.size(10.dp).clip(CircleShape).background(goodColor()))
+                            Box(
+                                modifier = Modifier.size(10.dp).clip(CircleShape)
+                                    .background(if (state.clientConnected) goodColor() else Color(0xFFFFA000))
+                            )
                             Spacer(modifier = Modifier.width(8.dp))
-                            Text("Active Sync Server", fontWeight = FontWeight.Bold, color = goodColor())
+                            Text(
+                                if (state.clientConnected) "Device connected" else "Waiting for a device…",
+                                fontWeight = FontWeight.Bold,
+                                color = if (state.clientConnected) goodColor() else MaterialTheme.colorScheme.onSurface
+                            )
                         }
-                        Card(
-                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Column(modifier = Modifier.padding(12.dp)) {
-                                Text("Ip Address: ${state.ipAddress}", fontSize = 13.sp)
-                                Text("Port Node: ${state.port}", fontSize = 13.sp)
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text("Pairing code", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
-                                Row(verticalAlignment = Alignment.CenterVertically) {
-                                    Text(
-                                        formatPairingCode(state.code),
-                                        fontSize = 13.sp,
-                                        fontFamily = FontFamily.Monospace,
-                                        fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.primary,
-                                        modifier = Modifier.weight(1f)
-                                    )
-                                    IconButton(onClick = {
-                                        clipboardManager.setText(AnnotatedString(formatPairingCode(state.code)))
-                                        Toast.makeText(context, "Pairing code copied", Toast.LENGTH_SHORT).show()
-                                    }) {
-                                        Icon(Icons.Default.ContentCopy, contentDescription = "Copy pairing code", modifier = Modifier.size(18.dp))
+
+                        when {
+                            // Before a peer connects: show the connection details + pairing QR.
+                            !state.clientConnected -> {
+                                Card(
+                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(modifier = Modifier.padding(12.dp)) {
+                                        Text("Ip Address: ${state.ipAddress}", fontSize = 13.sp)
+                                        Text("Port Node: ${state.port}", fontSize = 13.sp)
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text("Pairing code", fontSize = 11.sp, fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Text(
+                                                formatPairingCode(state.code),
+                                                fontSize = 13.sp,
+                                                fontFamily = FontFamily.Monospace,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.primary,
+                                                modifier = Modifier.weight(1f)
+                                            )
+                                            IconButton(onClick = {
+                                                clipboardManager.setText(AnnotatedString(formatPairingCode(state.code)))
+                                                Toast.makeText(context, "Pairing code copied", Toast.LENGTH_SHORT).show()
+                                            }) {
+                                                Icon(Icons.Default.ContentCopy, contentDescription = "Copy pairing code", modifier = Modifier.size(18.dp))
+                                            }
+                                        }
+
+                                        // Scannable pairing QR (IP + port + code). Encoded once per session.
+                                        val qrBitmap = remember(state.ipAddress, state.port, state.code) {
+                                            SyncQr.encodeQrBitmap(
+                                                SyncQr.buildSyncQrContent(state.ipAddress, state.port, state.code),
+                                                640
+                                            )
+                                        }
+                                        Spacer(modifier = Modifier.height(10.dp))
+                                        Text(
+                                            "Scan this on the other phone",
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                        Spacer(modifier = Modifier.height(6.dp))
+                                        Image(
+                                            bitmap = qrBitmap.asImageBitmap(),
+                                            contentDescription = "Pairing QR code",
+                                            modifier = Modifier
+                                                .align(Alignment.CenterHorizontally)
+                                                .background(Color.White)
+                                                .padding(8.dp)
+                                                .size(200.dp)
+                                        )
+                                    }
+                                }
+                            }
+
+                            // Peer connected and we are pushing the chosen payload.
+                            state.sending -> {
+                                CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                                Text(
+                                    "Sending selected data securely…",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+
+                            // Peer connected: the sender chooses what to share.
+                            else -> {
+                                Card(
+                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(modifier = Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                                        Text("Choose what to share", fontWeight = FontWeight.Bold)
+                                        Text(
+                                            "This won't override anything already on the other device; on a conflict the other device keeps its data.",
+                                            fontSize = 11.sp,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                        Button(
+                                            onClick = { viewModel.sendFullSync() },
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Text("Full Sync (everything)")
+                                        }
+                                        HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                                        Text("Or send only:", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                        SyncCheckRow("Messages", selMessages) { selMessages = it }
+                                        SyncCheckRow("Filter rules", selRules) { selRules = it }
+                                        SyncCheckRow("Finance ledger", selFinance) { selFinance = it }
+                                        SyncCheckRow("Reminders", selReminders) { selReminders = it }
+                                        SyncCheckRow("Scheduled messages", selScheduled) { selScheduled = it }
+                                        SyncCheckRow("Settings", selSettings) { selSettings = it }
+                                        if (selFinance || selReminders) {
+                                            Text(
+                                                "Finance and reminders carry their messages too.",
+                                                fontSize = 10.sp,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        }
+                                        val selection = SyncSelection(
+                                            messages = selMessages, rules = selRules, finance = selFinance,
+                                            reminders = selReminders, scheduled = selScheduled, settings = selSettings
+                                        )
+                                        Button(
+                                            onClick = { viewModel.sendSelectiveSync(selection) },
+                                            enabled = selection.hasAny,
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Text("Send selected")
+                                        }
                                     }
                                 }
                             }
                         }
+
                         Button(
                             onClick = { viewModel.stopHosting() },
                             colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
@@ -4209,6 +4450,15 @@ fun SyncScreen(viewModel: SmsOrganizerViewModel) {
                         CircularProgressIndicator(modifier = Modifier.size(24.dp))
                         Text("Handshaking over sockets...", style = MaterialTheme.typography.bodySmall)
                     }
+                    is SyncState.WaitingForSender -> {
+                        CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                        Text(
+                            "Connected — waiting for the sender to choose…",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.Bold,
+                            textAlign = TextAlign.Center
+                        )
+                    }
                     is SyncState.Syncing -> {
                         CircularProgressIndicator(modifier = Modifier.size(24.dp))
                         Text("Exchanging encrypted files securely...", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
@@ -4217,10 +4467,15 @@ fun SyncScreen(viewModel: SmsOrganizerViewModel) {
                         Icon(imageVector = Icons.Default.CheckCircle, contentDescription = "Check", tint = goodColor(), modifier = Modifier.size(36.dp))
                         Text("Sync Completed Successfully!", color = goodColor(), fontWeight = FontWeight.Bold)
                         if (state.exportedCount > 0) {
-                            Text("Exported ${state.exportedCount} messages.", fontSize = 12.sp)
+                            Text("Shared ${state.exportedCount} messages.", fontSize = 12.sp)
                         }
-                        if (state.importedCount > 0) {
-                            Text("Imported & merged ${state.importedCount} messages.", fontSize = 12.sp)
+                        if (state.addedCount > 0 || state.skippedCount > 0) {
+                            Text(
+                                "Added ${state.addedCount} new item${if (state.addedCount == 1) "" else "s"}, " +
+                                    "kept ${state.skippedCount} existing.",
+                                fontSize = 12.sp,
+                                textAlign = TextAlign.Center
+                            )
                         }
                         TextButton(onClick = { viewModel.resetSyncState() }) {
                             Text("Dismiss Status")
@@ -4344,12 +4599,44 @@ fun SyncScreen(viewModel: SmsOrganizerViewModel) {
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Text("Connect to Peer", fontWeight = FontWeight.Bold)
-                    
+
+                    OutlinedButton(
+                        onClick = {
+                            qrScanLauncher.launch(
+                                ScanOptions().apply {
+                                    setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                                    setPrompt("Scan the host's pairing QR")
+                                    setBeepEnabled(false)
+                                    setOrientationLocked(false)
+                                }
+                            )
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.QrCodeScanner, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Scan QR code")
+                    }
+                    Text(
+                        "Scan the QR on the host, or enter the details below.",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
                     OutlinedTextField(
                         value = ipInput,
                         onValueChange = { ipInput = it },
                         label = { Text("Host Server IP Address") },
                         placeholder = { Text("e.g. 192.168.1.45") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true
+                    )
+
+                    OutlinedTextField(
+                        value = portInput,
+                        onValueChange = { portInput = it.filter { ch -> ch.isDigit() } },
+                        label = { Text("Port (shown on the host)") },
+                        placeholder = { Text("e.g. 43917") },
                         modifier = Modifier.fillMaxWidth(),
                         singleLine = true
                     )
@@ -4367,15 +4654,17 @@ fun SyncScreen(viewModel: SmsOrganizerViewModel) {
 
                     Button(
                         onClick = {
-                            if (ipInput.trim().isEmpty() || pinValue.trim().isEmpty()) {
+                            val port = portInput.trim().toIntOrNull()
+                            if (ipInput.trim().isEmpty() || pinValue.trim().isEmpty() || port == null || port <= 0) {
+                                Toast.makeText(context, "Enter the host IP, port, and pairing code", Toast.LENGTH_SHORT).show()
                                 return@Button
                             }
-                            viewModel.joinSyncServer(ipInput, pinValue)
+                            viewModel.joinSyncServer(ipInput.trim(), port, pinValue)
                             showJoinPanel = false
                         },
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        Text("Establish Sync Sync Connection")
+                        Text("Establish Sync Connection")
                     }
                 }
             }
@@ -5632,6 +5921,9 @@ private fun AdvancedSettingsPage(
         }
         item {
             var reminderAlertsOn by viewModel.reminderAlertsEnabled
+            var reminderLeadDays by viewModel.reminderLeadDays
+            var reminderNearDays by viewModel.reminderNearDays
+            var reminderVibrationOn by viewModel.reminderVibrationEnabled
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
@@ -5648,7 +5940,7 @@ private fun AdvancedSettingsPage(
                         Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
                             Text("Reminder due alerts", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
                             Text(
-                                "Notify you in-app at 9:00 AM on a reminder's due date. Each reminder can be silenced or set to repeat individually.",
+                                "Notify you in-app at 9:00 AM each day through the advance-notice window below, up to a reminder's due date. Each reminder can be silenced or set to repeat individually.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
                             )
@@ -5665,6 +5957,45 @@ private fun AdvancedSettingsPage(
                         ) {
                             Text("Allow exact alarms", fontSize = 12.sp, fontWeight = FontWeight.Bold)
                         }
+                    }
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
+
+                    ReminderDaysStepperRow(
+                        title = "Advance notice (days)",
+                        description = "Start alerting this many days before the due date and repeat daily until then. 0 = alert only on the due date.",
+                        value = reminderLeadDays,
+                        minValue = 0,
+                        onValueChange = { reminderLeadDays = it }
+                    )
+
+                    ReminderDaysStepperRow(
+                        title = "Highlight when due within (days)",
+                        description = "Reminders due within this many days are highlighted in the Reminders list.",
+                        value = reminderNearDays,
+                        minValue = 0,
+                        onValueChange = { reminderNearDays = it }
+                    )
+
+                    HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
+                            Text("Vibrate on reminder alerts", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.Bold)
+                            Text(
+                                "Off by default. Your device's per-channel notification settings still apply.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.8f)
+                            )
+                        }
+                        Switch(
+                            checked = reminderVibrationOn,
+                            onCheckedChange = { reminderVibrationOn = it }
+                        )
                     }
                 }
             }
