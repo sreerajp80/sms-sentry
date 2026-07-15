@@ -201,16 +201,8 @@ object SmsNotificationHelper {
             notificationManager.createNotificationChannel(channel)
         }
 
-        // Try to extract OTP code (4-8 digits in a text representing verification)
-        val containsOtpKeywords = listOf("otp", "verification", "code", "passcode", "pin", "password", "security", "one-time", "secret").any {
-            body.lowercase(Locale.getDefault()).contains(it)
-        }
-        val otp = if (containsOtpKeywords) {
-            val regex = Regex("\\b\\d{4,8}\\b")
-            regex.find(body)?.value
-        } else {
-            null
-        }
+        // Try to extract OTP code using the unified OTP detection logic
+        val otp = `in`.sreerajp.sms_sentry.ui.detectOtp(body)
 
         val notificationId = System.currentTimeMillis().toInt()
 

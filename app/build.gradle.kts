@@ -32,7 +32,7 @@ android {
     minSdk = 24
     targetSdk = 36
     versionCode = 16
-    versionName = "16.5"
+    versionName = "16.6"
 
     // Real build date, injected at build time and shown on the About screen.
     val buildDate = SimpleDateFormat("yyyy-MM-dd").format(Date())

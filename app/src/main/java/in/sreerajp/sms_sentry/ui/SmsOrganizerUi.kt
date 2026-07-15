@@ -2535,11 +2535,68 @@ private val OTP_KEYWORDS = listOf(
     "otp", "verification", "code", "passcode", "pin", "password", "security", "one-time", "secret"
 )
 
+// Regex for prefixes indicating card, account, ID, or currency amount (making it not an OTP)
+private val INVALID_PREFIX_REGEX = Regex(
+    "(?i)(?:\\b(?:a/c|acct|account|card|uan|id|ref|txn|transaction|refid|reference|otp-id|otpid|number|no|ending in|ending with|rs|inr|usd)\\b[\\s:-]*|\\$[\\s]*|₹[\\s]*|[Xx\\*·•\\s-]*[Xx\\*·•]+[\\s-]*)$"
+)
+
+// Regex for suffixes indicating units of measurement/data/money/time (making it not an OTP)
+private val INVALID_SUFFIX_REGEX = Regex(
+    "^(?i)[\\s:-]*(?:gb|mb|kb|tb|mah|hz|ghz|rs|inr|usd|pts|points|mins|min|sec|seconds|days|hours|weeks|months|yr|years|am|pm|v|w|kw|l|ml|kg|g|km|m|cm|inch|in|ft|yards|miles|per|percent|%|units|items|pcs|pieces)\\b"
+)
+
 /** Returns the OTP code in a message body if it looks like a verification message, else null. */
 fun detectOtp(body: String): String? {
     val lower = body.lowercase(Locale.getDefault())
     if (OTP_KEYWORDS.none { lower.contains(it) }) return null
-    return Regex("\\b\\d{4,8}\\b").find(body)?.value
+
+    val candidateMatches = Regex("\\b\\d{4,8}\\b").findAll(body).toList()
+    if (candidateMatches.isEmpty()) return null
+
+    val validCandidates = candidateMatches.filter { match ->
+        val start = match.range.first
+        val end = match.range.last + 1
+        val prefix = body.substring(0, start)
+        val suffix = body.substring(end)
+
+        // Check if candidate is preceded by card/account/ID markers or currency symbols
+        if (INVALID_PREFIX_REGEX.containsMatchIn(prefix)) return@filter false
+
+        // Check if candidate is followed by data/time/money/count units
+        if (INVALID_SUFFIX_REGEX.containsMatchIn(suffix)) return@filter false
+
+        true
+    }
+
+    if (validCandidates.isEmpty()) return null
+    if (validCandidates.size == 1) return validCandidates.first().value
+
+    // If multiple valid candidates, score/rank them by character distance to the nearest OTP keyword in the message body
+    val keywordIndices = mutableListOf<Int>()
+    for (keyword in OTP_KEYWORDS) {
+        var idx = lower.indexOf(keyword)
+        while (idx != -1) {
+            keywordIndices.add(idx)
+            idx = lower.indexOf(keyword, idx + 1)
+        }
+    }
+
+    if (keywordIndices.isEmpty()) {
+        return validCandidates.first().value
+    }
+
+    // Pick the candidate closest to any keyword index
+    return validCandidates.minByOrNull { match ->
+        val candidateStart = match.range.first
+        var minDistance = Int.MAX_VALUE
+        for (kwIdx in keywordIndices) {
+            val dist = kotlin.math.abs(candidateStart - kwIdx)
+            if (dist < minDistance) {
+                minDistance = dist
+            }
+        }
+        minDistance
+    }?.value
 }
 
 /** Indian-grouped rupee formatter; drops the decimals when the amount is a whole number. */
