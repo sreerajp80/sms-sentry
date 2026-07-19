@@ -169,6 +169,11 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
     private val _contactPhotos = MutableStateFlow<Map<String, Uri>>(emptyMap())
     val contactPhotos: StateFlow<Map<String, Uri>> = _contactPhotos.asStateFlow()
 
+    // Contact suggestions from the address book matching the active query in Compose
+    private val _contactSuggestions = MutableStateFlow<List<ContactNameResolver.ContactSuggestion>>(emptyList())
+    val contactSuggestions: StateFlow<List<ContactNameResolver.ContactSuggestion>> = _contactSuggestions.asStateFlow()
+
+
     init {
         viewModelScope.launch {
             if (hasReadSmsPermission()) {
@@ -225,6 +230,20 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
         ContactNameResolver.clearCache()
         viewModelScope.launch { resolveContactNames(allMessages.value.map { it.sender }) }
     }
+
+    private var contactSearchJob: kotlinx.coroutines.Job? = null
+
+    /** Search for contacts matching [query] off the main thread and update suggestions. */
+    fun searchContactSuggestions(query: String) {
+        contactSearchJob?.cancel()
+        contactSearchJob = viewModelScope.launch {
+            val results = withContext(Dispatchers.IO) {
+                ContactNameResolver.queryContacts(getApplication(), query)
+            }
+            _contactSuggestions.value = results
+        }
+    }
+
 
     /** Re-read whether we are the default SMS app (call from the Activity's onResume). */
     fun refreshDefaultStatus() {

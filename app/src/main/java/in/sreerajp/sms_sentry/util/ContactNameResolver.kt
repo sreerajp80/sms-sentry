@@ -93,4 +93,64 @@ object ContactNameResolver {
         }
         return digits >= 3
     }
+
+    /** Represents a query suggestion from the contacts database. */
+    data class ContactSuggestion(
+        val name: String,
+        val number: String,
+        val photoUri: Uri? = null
+    )
+
+    /**
+     * Queries the Android Contacts provider for contacts matching [query].
+     * If [query] is empty, returns all contacts with phone numbers.
+     */
+    fun queryContacts(context: Context, query: String): List<ContactSuggestion> {
+        if (!hasPermission(context)) return emptyList()
+        val list = mutableListOf<ContactSuggestion>()
+
+        val uri = if (query.isBlank()) {
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI
+        } else {
+            Uri.withAppendedPath(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_FILTER_URI,
+                Uri.encode(query)
+            )
+        }
+
+        val projection = arrayOf(
+            ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+            ContactsContract.CommonDataKinds.Phone.NUMBER,
+            ContactsContract.CommonDataKinds.Phone.PHOTO_URI
+        )
+
+        try {
+            context.contentResolver.query(
+                uri,
+                projection,
+                null, null,
+                "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME} ASC"
+            )?.use { c ->
+                val nameIdx = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
+                val numIdx = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+                val photoIdx = c.getColumnIndex(ContactsContract.CommonDataKinds.Phone.PHOTO_URI)
+
+                while (c.moveToNext()) {
+                    val name = if (nameIdx >= 0) c.getString(nameIdx) else null
+                    val number = if (numIdx >= 0) c.getString(numIdx) else null
+                    val photoUriStr = if (photoIdx >= 0) c.getString(photoIdx) else null
+                    val photoUri = photoUriStr?.takeIf { it.isNotBlank() }?.let { Uri.parse(it) }
+
+                    if (!name.isNullOrBlank() && !number.isNullOrBlank()) {
+                        list.add(ContactSuggestion(name, number, photoUri))
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            // Ignore query exceptions
+        }
+
+        return list.distinctBy { it.number }
+    }
 }
+

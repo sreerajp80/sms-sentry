@@ -95,6 +95,7 @@ import `in`.sreerajp.sms_sentry.util.AboutInfo
 import `in`.sreerajp.sms_sentry.util.RecurrenceUtil
 import `in`.sreerajp.sms_sentry.util.SimManager
 import `in`.sreerajp.sms_sentry.util.SmsSegment
+import `in`.sreerajp.sms_sentry.util.ContactNameResolver
 import `in`.sreerajp.sms_sentry.util.loadAboutConfig
 import `in`.sreerajp.sms_sentry.BuildConfig
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -6457,6 +6458,11 @@ fun ComposeSmsDialog(
     val suggestedSenders = remember(inboxMessages) {
         inboxMessages.map { it.sender }.distinct().filter { it.isNotBlank() }.take(5)
     }
+    val contactSuggestions by viewModel.contactSuggestions.collectAsState()
+
+    LaunchedEffect(senderInput) {
+        viewModel.searchContactSuggestions(senderInput)
+    }
 
     // Fold into an existing conversation the moment the recipient resolves to one (typed full
     // number or tapped suggestion). Exact-match only, so a partial prefix never jumps mid-typing.
@@ -6824,75 +6830,97 @@ fun ComposeSmsDialog(
                         .fillMaxWidth()
                         .background(Color(0xFF090A10))
                 ) {
-                    // Filter matching senders dynamically
+                    // Filter and merge matching contacts + recent senders dynamically
                     val demoList = listOf("+91 98302 00100", "+1 (555) 019-2834", "+91 94470 12345", "SBI-ALRT", "HDFC-TXN", "IRCTC", "Google-OTP")
-                    val allSenders = (suggestedSenders + demoList).distinct().take(5)
-                    val filteredSenders = remember(senderInput, allSenders) {
-                        val filtered = if (senderInput.isBlank()) {
-                            allSenders
+                    val allRecentSenders = (suggestedSenders + demoList).distinct()
+
+                    val displayedSuggestions = remember(senderInput, contactSuggestions, allRecentSenders) {
+                        if (senderInput.isBlank()) {
+                            // Show top 5 recent senders resolved as suggestions
+                            allRecentSenders.take(5).map { number ->
+                                val resolvedName = viewModel.contactNames.value[number]
+                                ContactNameResolver.ContactSuggestion(
+                                    name = resolvedName ?: number,
+                                    number = number,
+                                    photoUri = viewModel.contactPhotos.value[number]
+                                )
+                            }
                         } else {
-                            allSenders.filter { it.contains(senderInput, ignoreCase = true) }
+                            // Filter matching recent senders
+                            val matchingRecent = allRecentSenders.filter { number ->
+                                number.contains(senderInput, ignoreCase = true) ||
+                                        (viewModel.contactNames.value[number]?.contains(senderInput, ignoreCase = true) == true)
+                            }.map { number ->
+                                val resolvedName = viewModel.contactNames.value[number]
+                                ContactNameResolver.ContactSuggestion(
+                                    name = resolvedName ?: number,
+                                    number = number,
+                                    photoUri = viewModel.contactPhotos.value[number]
+                                )
+                            }
+                            // Combine with contacts database suggestions
+                            (contactSuggestions + matchingRecent).distinctBy { it.number.trim() }.take(15)
                         }
-                        filtered.take(5)
                     }
 
                     LazyColumn(
                         modifier = Modifier.fillMaxSize(),
                         contentPadding = PaddingValues(bottom = 16.dp)
                     ) {
-                        if (filteredSenders.isNotEmpty()) {
+                        if (displayedSuggestions.isNotEmpty()) {
                             item {
                                 Text(
-                                    text = "Recent Senders & Suggested Contacts",
+                                    text = if (senderInput.isBlank()) "Recent Senders & Suggested Contacts" else "Search Results",
                                     color = Color(0xFF5B6275),
                                     style = MaterialTheme.typography.labelSmall,
                                     modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
                                 )
                             }
 
-                            items(filteredSenders) { sender ->
+                            items(displayedSuggestions) { suggestion ->
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clickable {
-                                            senderInput = sender
+                                            senderInput = suggestion.number
                                         }
                                         .padding(horizontal = 16.dp, vertical = 10.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    val senderChar = sender.firstOrNull { it.isLetter() }?.uppercase() ?: "#"
-                                    val avatarColor = remember(sender) {
+                                    val displayName = suggestion.name
+                                    val displayChar = displayName.firstOrNull { it.isLetter() }?.uppercase() ?: "#"
+                                    val avatarColor = remember(suggestion.number) {
                                         val colors = listOf(
                                             Color(0xFF6F53A4), Color(0xFF386B52), 
                                             Color(0xFF2B5EA0), Color(0xFFD32F2F), 
                                             Color(0xFF006874), Color(0xFFF57C00)
                                         )
-                                        colors[sender.hashCode().coerceAtLeast(0) % colors.size]
+                                        colors[suggestion.number.hashCode().coerceAtLeast(0) % colors.size]
                                     }
 
-                                    Box(
-                                        modifier = Modifier
-                                            .size(40.dp)
-                                            .background(avatarColor, CircleShape),
-                                        contentAlignment = Alignment.Center
-                                    ) {
-                                        Text(
-                                            text = senderChar,
-                                            color = Color.White,
-                                            style = MaterialTheme.typography.bodyMedium,
-                                            fontWeight = FontWeight.Bold
-                                        )
-                                    }
+                                    AvatarTile(
+                                        label = displayChar,
+                                        color = avatarColor,
+                                        size = 40.dp,
+                                        corner = 20.dp,
+                                        photoUri = suggestion.photoUri
+                                    )
+                                    
                                     Spacer(modifier = Modifier.width(16.dp))
                                     Column {
                                         Text(
-                                            text = sender,
+                                            text = displayName,
                                             color = Color(0xFFE2E4EB),
                                             style = MaterialTheme.typography.bodyMedium,
                                             fontWeight = FontWeight.Medium
                                         )
+                                        val hasName = displayName != suggestion.number
                                         Text(
-                                            text = if (sender.any { it.isLetter() }) "Business ID" else "Mobile Recipient",
+                                            text = if (hasName) {
+                                                suggestion.number
+                                            } else {
+                                                if (suggestion.number.any { it.isLetter() }) "Business ID" else "Mobile Recipient"
+                                            },
                                             color = Color(0xFF5B6275),
                                             style = MaterialTheme.typography.bodySmall
                                         )
