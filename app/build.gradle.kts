@@ -32,7 +32,7 @@ android {
     minSdk = 24
     targetSdk = 36
     versionCode = 16
-    versionName = "16.7"
+    versionName = "16.11"
 
     // Real build date, injected at build time and shown on the About screen.
     val buildDate = SimpleDateFormat("yyyy-MM-dd").format(Date())
@@ -76,6 +76,13 @@ kotlin {
   compilerOptions {
     jvmTarget = JvmTarget.JVM_17
   }
+}
+
+// The Android SDK 36 system images Robolectric loads are Java 21 bytecode, so it refuses to
+// build a sandbox on an older JVM ("Android SDK 36 requires Java 21"). Pin the test workers to
+// 21 regardless of the ambient JAVA_HOME. Compilation stays on Java 17 (see compileOptions).
+tasks.withType<Test>().configureEach {
+  javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(21)) })
 }
 
 // Configure the Secrets Gradle Plugin to use .env and .env.example files

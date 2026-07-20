@@ -21,11 +21,76 @@ data class ClassificationResult(
 
 object SmsClassifier {
 
-    // Genuine spam / scam patterns (lottery, prize bait, crypto pump, etc.).
-    private val SPAM_KEYWORDS = listOf(
-        "win", "winner", "won", "prize", "lottery", "jackpot", "casino", "free bonus",
-        "claim", "unlocked", "congrats", "congratulations", "invest", "crypto", "bitcoin"
+    // ---- Spam scoring engine -------------------------------------------------------------
+    // Spam is decided by a weighted score, not a single-keyword trip. Every scam/urgency signal
+    // is matched on word/phrase boundaries (see [boundaryPattern]/[spamScore]) so a substring
+    // like "invest" inside "Investment" can never flag a message. A message is Spam only when the
+    // score reaches [SPAM_THRESHOLD]; a trusted institutional sender or genuine transactional
+    // context pulls the score back down. This is only the offline fallback — custom CONTACT and
+    // KEYWORD rules in [classify] run first and keep full priority.
+    private const val SPAM_THRESHOLD = 3
+
+    // Strong scam / fraud indicators — curated phrases plus a few unambiguous whole words. Each
+    // distinct hit adds [SCAM_WEIGHT]. Bare generic finance words (e.g. "invest") are deliberately
+    // absent so real investment/statement messages are never spam.
+    private const val SCAM_WEIGHT = 3
+    private val SCAM_PHRASES = listOf(
+        "lottery", "jackpot", "casino", "you won", "you have won", "won a prize", "won rs",
+        "claim your prize", "claim your reward", "claim your gift", "free bonus", "lucky winner",
+        "lucky draw", "selected winner", "guaranteed returns", "double your money", "get rich",
+        "work from home", "earn money", "earn daily", "part time job", "loan approved",
+        "pre-approved loan", "kyc suspended", "account suspended", "crypto", "bitcoin"
     )
+
+    // URL shorteners commonly used to hide scam landing pages. Weak on their own (+[LINK_WEIGHT]);
+    // matched as plain substrings since these tokens are distinctive.
+    private const val LINK_WEIGHT = 1
+    private val URL_SHORTENERS = listOf(
+        "bit.ly", "tinyurl", "goo.gl", "t.co/", "is.gd", "cutt.ly", "rb.gy", "tiny.cc", "ow.ly"
+    )
+
+    // High-pressure urgency cues. Weak on their own (+[URGENCY_WEIGHT]); meaningful only when
+    // stacked with scam bait.
+    private const val URGENCY_WEIGHT = 1
+    private val URGENCY_PHRASES = listOf(
+        "act now", "hurry", "last chance", "expires today", "don't miss", "dont miss",
+        "urgent", "immediately", "limited seats", "offer ends"
+    )
+
+    // Known legitimate bulk senders (banks, pensions, insurers, govt, telecom). A DLT header
+    // matching one of these is a trusted institution and earns a strong negative weight. This is
+    // only a default safeguard — it is strictly weaker than an explicit user CONTACT->Spam rule,
+    // which short-circuits before scoring.
+    private const val TRUSTED_WEIGHT = 5
+    private val TRUSTED_ENTITIES = listOf(
+        // Banks
+        "HDFC", "SBIBNK", "SBI", "ICICI", "AXIS", "HSBC", "CITI", "KOTAK", "PNB", "BOI",
+        "YESBK", "INDUS", "CANBNK", "UNIONB", "IDFC", "RBLBNK",
+        // NPS / pensions
+        "PTNNPS", "NPSCRA", "PROTEAN", "NSDL", "PFRDA", "CAMSKRA",
+        // Insurers
+        "NIALTD", "NIACL", "LICIND", "HDFCLI", "ICICIP", "SBILIF", "MAXLIF", "STARHE",
+        // Govt / utility / telecom
+        "MORTH", "ITDCPC", "UIDAI", "EPFO", "IRCTC", "AIRTEL", "JIONET", "VODAFON", "BSNL"
+    )
+
+    // Transactional / informational context a real scam almost never carries. When present it
+    // pulls the score down by [CONTEXT_WEIGHT] (once), so a genuine bank/statement/OTP/policy
+    // message is not spam even if it happens to use a strong-sounding word.
+    private const val CONTEXT_WEIGHT = 2
+    private val LEGIT_CONTEXT_KEYWORDS = listOf(
+        "debited", "credited", "a/c", "account", "available bal", "avail bal", "balance",
+        "statement", "policy", "premium", "otp", "one time password", "transaction", "txn",
+        "e-mandate", "mandate", "installment", "investment value", "portfolio", "tier i", "tier ii"
+    )
+
+    // Boundary-anchored patterns for the scam/urgency phrases, compiled once. "\b…\b" prevents
+    // substring accidents (e.g. "invest" matching "investment").
+    private fun boundaryPattern(term: String): Pattern =
+        Pattern.compile("\\b" + Pattern.quote(term) + "\\b", Pattern.CASE_INSENSITIVE)
+
+    private val scamPatterns = SCAM_PHRASES.map(::boundaryPattern)
+    private val urgencyPatterns = URGENCY_PHRASES.map(::boundaryPattern)
 
     // Marketing / advertising patterns → Promotions (legitimate offers, not scams).
     private val PROMO_KEYWORDS = listOf(
@@ -178,13 +243,10 @@ object SmsClassifier {
 
         // 3. Fallback to basic heuristics (offline classification rules)
 
-        // Is it SPAM?
-        val containsSpamKeyword = SPAM_KEYWORDS.any { normalizedBody.contains(it) }
-        // Spam messages usually come from alphabetic headers without typical transactional tags
-        val isProbableSpamSender = sender.length > 5 && !sender.any { it.isDigit() } &&
-                !(sender.contains("bank", true) || sender.contains("pay", true) || sender.contains("remi", true))
-
-        if (!allowlisted && (containsSpamKeyword || (isProbableSpamSender && normalizedBody.contains("promo")))) {
+        // Is it SPAM? Weighted, sender-aware score instead of a single-keyword trip (see the
+        // scoring-engine block above). Only the offline fallback: custom CONTACT/KEYWORD rules
+        // handled above already had their say, and the NotSpam allowlist still fully overrides.
+        if (!allowlisted && spamScore(sender, normalizedBody) >= SPAM_THRESHOLD) {
             return ClassificationResult(category = "Spam", isBlocked = true)
         }
 
@@ -229,6 +291,39 @@ object SmsClassifier {
             }
         }
         return digits >= 3
+    }
+
+    /**
+     * Weighted spam score for the offline fallback. Positive signals (scam phrases, shortened
+     * links, urgency) push toward Spam; a trusted institutional sender and genuine transactional
+     * context pull it back down. The caller marks Spam only when the score reaches
+     * [SPAM_THRESHOLD]. [normalizedBody] must already be lower-cased.
+     */
+    private fun spamScore(sender: String, normalizedBody: String): Int {
+        var score = 0
+
+        // Positive signals.
+        score += scamPatterns.count { it.matcher(normalizedBody).find() } * SCAM_WEIGHT
+        if (URL_SHORTENERS.any { normalizedBody.contains(it) }) score += LINK_WEIGHT
+        if (urgencyPatterns.any { it.matcher(normalizedBody).find() }) score += URGENCY_WEIGHT
+
+        // Negative signals (each applied once).
+        if (isTrustedSender(sender)) score -= TRUSTED_WEIGHT
+        if (LEGIT_CONTEXT_KEYWORDS.any { normalizedBody.contains(it) }) score -= CONTEXT_WEIGHT
+
+        return score
+    }
+
+    /**
+     * True when [sender] is a known legitimate bulk sender (bank / pension / insurer / govt /
+     * telecom DLT header). A purely dialable number is a person, never an institution, so it is
+     * not trusted here — body signals alone decide for those.
+     */
+    private fun isTrustedSender(sender: String): Boolean {
+        if (looksLikePhoneNumber(sender)) return false
+        val cleaned = sender.uppercase(Locale.ROOT).replace(Regex("[^A-Z]"), "")
+        if (cleaned.isEmpty()) return false
+        return TRUSTED_ENTITIES.any { cleaned.contains(it) }
     }
 
     private fun runExtractions(

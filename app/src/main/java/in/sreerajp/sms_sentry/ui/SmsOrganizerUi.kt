@@ -2,6 +2,7 @@ package `in`.sreerajp.sms_sentry.ui
 
 import android.app.Activity
 import android.app.KeyguardManager
+import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
 import android.widget.Toast
@@ -60,6 +61,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.ui.text.input.ImeAction
@@ -126,6 +128,31 @@ private fun photoUriFor(sender: String): android.net.Uri? = LocalContactPhotos.c
 @Composable
 private fun displayNameFor(sender: String): String =
     LocalContactNames.current[sender] ?: sender
+
+/**
+ * An [IconButton] that shows a plain tooltip with [tooltip] text on long press
+ * (press-and-hold). A normal tap still runs [onClick]. Pass [modifier] to keep
+ * any `testTag` on the button itself.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun TooltipIconButton(
+    tooltip: String,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    content: @Composable () -> Unit
+) {
+    TooltipBox(
+        positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
+        tooltip = { PlainTooltip { Text(tooltip) } },
+        state = rememberTooltipState()
+    ) {
+        IconButton(onClick = onClick, enabled = enabled, modifier = modifier) {
+            content()
+        }
+    }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -219,7 +246,8 @@ fun SmsOrganizerApp(viewModel: SmsOrganizerViewModel) {
                         }
                     },
                     actions = {
-                        IconButton(
+                        TooltipIconButton(
+                            tooltip = "New message",
                             onClick = { showComposeDialog = true },
                             modifier = Modifier.testTag("open_composer_bar_button")
                         ) {
@@ -1040,6 +1068,7 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
     }
 
     val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
 
     // --- Multi-select state (long-press a card to select; act on one or more senders) ---
     var selectionMode by remember { mutableStateOf(false) }
@@ -1074,13 +1103,23 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
       if (selectionMode) {
         // Contextual action bar (mirrors ThreadScreen's selection header).
         val allMuted = selectedSenders.isNotEmpty() && selectedSenders.all { viewModel.isMuted(it) }
+        // Text for the Copy / Share menu items: the latest message of each selected
+        // conversation — the same line the card shows — newest conversation first.
+        fun selectedLatestBodies(): String =
+            searchSource
+                .filter { it.sender in selectedSenders }
+                .groupBy { it.sender }
+                .mapNotNull { (_, msgs) -> msgs.maxByOrNull { it.timestamp } }
+                .sortedByDescending { it.timestamp }
+                .joinToString("\n\n") { it.body }
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .padding(start = 6.dp, end = 8.dp, top = 6.dp, bottom = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(
+            TooltipIconButton(
+                tooltip = "Cancel selection",
                 onClick = { clearSelection() },
                 modifier = Modifier.testTag("inbox_selection_close")
             ) {
@@ -1098,7 +1137,8 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
                 color = MaterialTheme.colorScheme.onBackground,
                 modifier = Modifier.weight(1f)
             )
-            IconButton(
+            TooltipIconButton(
+                tooltip = "Mark as read",
                 onClick = { showMarkReadDialog = true },
                 modifier = Modifier.testTag("inbox_mark_read_selected")
             ) {
@@ -1109,7 +1149,8 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
                     modifier = Modifier.size(22.dp)
                 )
             }
-            IconButton(
+            TooltipIconButton(
+                tooltip = "Move to folder",
                 onClick = { showMoveSheet = true },
                 modifier = Modifier.testTag("inbox_move_selected")
             ) {
@@ -1120,7 +1161,8 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
                     modifier = Modifier.size(22.dp)
                 )
             }
-            IconButton(
+            TooltipIconButton(
+                tooltip = "Delete",
                 onClick = { showDeleteSelectedDialog = true },
                 modifier = Modifier.testTag("inbox_delete_selected")
             ) {
@@ -1132,7 +1174,8 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
                 )
             }
             Box {
-                IconButton(
+                TooltipIconButton(
+                    tooltip = "More actions",
                     onClick = { menuOpen = true },
                     modifier = Modifier.testTag("inbox_selection_menu_button")
                 ) {
@@ -1147,6 +1190,32 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
                     expanded = menuOpen,
                     onDismissRequest = { menuOpen = false }
                 ) {
+                    DropdownMenuItem(
+                        text = { Text("Copy message") },
+                        leadingIcon = { Icon(Icons.Default.ContentCopy, contentDescription = null) },
+                        modifier = Modifier.testTag("inbox_copy_selected"),
+                        onClick = {
+                            menuOpen = false
+                            clipboardManager.setText(AnnotatedString(selectedLatestBodies()))
+                            val n = selectedSenders.size
+                            Toast.makeText(
+                                context,
+                                if (n == 1) "Message copied" else "$n messages copied",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            clearSelection()
+                        }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("Share") },
+                        leadingIcon = { Icon(Icons.Default.Share, contentDescription = null) },
+                        modifier = Modifier.testTag("inbox_share_selected"),
+                        onClick = {
+                            menuOpen = false
+                            shareText(context, selectedLatestBodies(), "Share message")
+                            clearSelection()
+                        }
+                    )
                     DropdownMenuItem(
                         text = { Text(if (allMuted) "Unmute notifications" else "Mute notifications") },
                         leadingIcon = { Icon(Icons.Default.NotificationsOff, contentDescription = null) },
@@ -1218,7 +1287,8 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
             },
             trailingIcon = {
                 if (searchQuery.isNotEmpty()) {
-                    IconButton(
+                    TooltipIconButton(
+                        tooltip = "Clear search",
                         onClick = { searchQuery = "" },
                         modifier = Modifier.testTag("inbox_search_clear")
                     ) {
@@ -1603,6 +1673,27 @@ fun deliveryStatusLabel(msg: SMSMessage): String? {
 }
 
 /**
+ * Hands [text] to another app through the system share sheet. Used by every share
+ * entry point (message detail, thread selection, conversation-list menu) so they all
+ * behave the same. Falls back to a toast when the device has nothing to share with.
+ */
+fun shareText(context: Context, text: String, chooserTitle: String) {
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_TEXT, text)
+    }
+    val chooser = Intent.createChooser(send, chooserTitle)
+    // A non-Activity context (rare here, but possible) cannot start an activity
+    // without its own task.
+    if (context !is Activity) chooser.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    try {
+        context.startActivity(chooser)
+    } catch (e: ActivityNotFoundException) {
+        Toast.makeText(context, "No app to share with", Toast.LENGTH_SHORT).show()
+    }
+}
+
+/**
  * A single message result row for inbox search. Tapping opens the sender's conversation
  * thread; long-pressing enters the inbox's (sender-based) multi-select mode. Because results
  * are message-level but selection is sender-level, selecting one result marks every result
@@ -1923,6 +2014,7 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
     // Restore any saved draft for this thread; persist it again when leaving (see DisposableEffect).
     var replyText by remember(sender) { mutableStateOf(viewModel.draftFor(sender)) }
     val context = LocalContext.current
+    val clipboardManager = LocalClipboardManager.current
 
     DisposableEffect(sender) {
         onDispose { viewModel.saveDraft(sender, replyText) }
@@ -1951,8 +2043,11 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
     var selectionMode by remember { mutableStateOf(false) }
     val selectedIds = remember { mutableStateListOf<Long>() }
     var menuOpen by remember { mutableStateOf(false) }
+    var selectionMenuOpen by remember { mutableStateOf(false) }
     var showDeleteSelectedDialog by remember { mutableStateOf(false) }
     var showDeleteChatDialog by remember { mutableStateOf(false) }
+    // Holds the loaded details while the "Message info" sheet is open (null = closed).
+    var infoMessage by remember { mutableStateOf<MessageInfo?>(null) }
 
     fun clearSelection() {
         selectedIds.clear()
@@ -1991,7 +2086,8 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                     .padding(start = 6.dp, end = 8.dp, top = 6.dp, bottom = 10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(
+                TooltipIconButton(
+                    tooltip = "Cancel selection",
                     onClick = { clearSelection() },
                     modifier = Modifier.testTag("thread_selection_close")
                 ) {
@@ -2009,7 +2105,8 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                     color = MaterialTheme.colorScheme.onBackground,
                     modifier = Modifier.weight(1f)
                 )
-                IconButton(
+                TooltipIconButton(
+                    tooltip = "Mark as read",
                     onClick = {
                         if (selectedIds.isNotEmpty()) {
                             viewModel.markMessagesRead(selectedIds.toList())
@@ -2027,7 +2124,8 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                         modifier = Modifier.size(22.dp)
                     )
                 }
-                IconButton(
+                TooltipIconButton(
+                    tooltip = "Mark as unread",
                     onClick = {
                         if (selectedIds.isNotEmpty()) {
                             viewModel.markMessagesUnread(selectedIds.toList())
@@ -2045,7 +2143,38 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                         modifier = Modifier.size(22.dp)
                     )
                 }
-                IconButton(
+                TooltipIconButton(
+                    tooltip = "Copy",
+                    onClick = {
+                        if (selectedIds.isNotEmpty()) {
+                            // Copy in the order the messages appear on screen, not the order they
+                            // happened to be tapped in.
+                            val bodies = threadMessages
+                                .filter { it.id in selectedIds }
+                                .joinToString("\n\n") { it.body }
+                            clipboardManager.setText(AnnotatedString(bodies))
+                            val n = selectedIds.size
+                            Toast.makeText(
+                                context,
+                                if (n == 1) "Message copied" else "$n messages copied",
+                                Toast.LENGTH_SHORT
+                            ).show()
+                            clearSelection()
+                        }
+                    },
+                    enabled = selectedIds.isNotEmpty(),
+                    modifier = Modifier.testTag("thread_copy_selected")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.ContentCopy,
+                        contentDescription = "Copy",
+                        tint = if (selectedIds.isNotEmpty()) MaterialTheme.colorScheme.onSurfaceVariant
+                               else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                        modifier = Modifier.size(20.dp)
+                    )
+                }
+                TooltipIconButton(
+                    tooltip = "Delete",
                     onClick = { if (selectedIds.isNotEmpty()) showDeleteSelectedDialog = true },
                     enabled = selectedIds.isNotEmpty(),
                     modifier = Modifier.testTag("thread_delete_selected")
@@ -2058,6 +2187,60 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                         modifier = Modifier.size(22.dp)
                     )
                 }
+                Box {
+                    TooltipIconButton(
+                        tooltip = "More actions",
+                        onClick = { selectionMenuOpen = true },
+                        enabled = selectedIds.isNotEmpty(),
+                        modifier = Modifier.testTag("thread_selection_menu_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.MoreVert,
+                            contentDescription = "More actions",
+                            tint = if (selectedIds.isNotEmpty()) MaterialTheme.colorScheme.onSurfaceVariant
+                                   else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.4f),
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = selectionMenuOpen,
+                        onDismissRequest = { selectionMenuOpen = false }
+                    ) {
+                        DropdownMenuItem(
+                            text = { Text("Share") },
+                            leadingIcon = { Icon(Icons.Default.Share, contentDescription = null) },
+                            modifier = Modifier.testTag("thread_share_selected"),
+                            onClick = {
+                                selectionMenuOpen = false
+                                if (selectedIds.isNotEmpty()) {
+                                    // Same text the Copy button produces, in on-screen order.
+                                    val bodies = threadMessages
+                                        .filter { it.id in selectedIds }
+                                        .joinToString("\n\n") { it.body }
+                                    shareText(context, bodies, "Share message")
+                                    clearSelection()
+                                }
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Message info") },
+                            leadingIcon = { Icon(Icons.Default.Info, contentDescription = null) },
+                            // Details are for a single message only.
+                            enabled = selectedIds.size == 1,
+                            modifier = Modifier.testTag("thread_message_info"),
+                            onClick = {
+                                selectionMenuOpen = false
+                                val msg = threadMessages.firstOrNull { it.id == selectedIds.first() }
+                                if (msg != null) {
+                                    viewModel.loadMessageDetails(msg) { info ->
+                                        infoMessage = info
+                                    }
+                                    clearSelection()
+                                }
+                            }
+                        )
+                    }
+                }
             }
         } else {
             Row(
@@ -2066,7 +2249,8 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                     .padding(start = 6.dp, end = 8.dp, top = 6.dp, bottom = 10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(
+                TooltipIconButton(
+                    tooltip = "Back",
                     onClick = { viewModel.closeThread() },
                     modifier = Modifier.testTag("thread_back_button")
                 ) {
@@ -2104,7 +2288,8 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                     )
                 }
                 Box {
-                    IconButton(
+                    TooltipIconButton(
+                        tooltip = "More actions",
                         onClick = { menuOpen = true },
                         modifier = Modifier.testTag("thread_menu_button")
                     ) {
@@ -2235,6 +2420,9 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                 }
             )
         }
+        infoMessage?.let { info ->
+            MessageInfoDialog(info = info, onDismiss = { infoMessage = null })
+        }
         if (showDeleteChatDialog) {
             AlertDialog(
                 onDismissRequest = { showDeleteChatDialog = false },
@@ -2330,7 +2518,8 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                     )
                 }
                 val canSend = replyText.trim().isNotEmpty()
-                IconButton(
+                TooltipIconButton(
+                    tooltip = "Send",
                     onClick = {
                         if (canSend) {
                             viewModel.sendSms(sender, replyText.trim(), viewModel.defaultOutgoingSlot())
@@ -2727,7 +2916,8 @@ fun SenderInfoScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                 .padding(start = 6.dp, end = 8.dp, top = 6.dp, bottom = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(
+            TooltipIconButton(
+                tooltip = "Back",
                 onClick = { viewModel.closeSenderInfo() },
                 modifier = Modifier.testTag("sender_info_back_button")
             ) {
@@ -3042,6 +3232,120 @@ private fun SwipeAction(
 // ==========================================
 // SCREEN: MESSAGE DETAIL (Direction A "in depth")
 // ==========================================
+/**
+ * "Message info" sheet: per-message metadata. Entity-backed fields always show; provider-only
+ * fields render as "Not available" when the message has no system row / READ_SMS is denied.
+ */
+@Composable
+fun MessageInfoDialog(info: MessageInfo, onDismiss: () -> Unit) {
+    val fullFmt = remember { SimpleDateFormat("dd MMM yyyy · hh:mm:ss a", Locale.getDefault()) }
+    fun date(ts: Long?): String = ts?.let { fullFmt.format(Date(it)) } ?: NOT_AVAILABLE
+    val senderName = displayNameFor(info.sender)
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        modifier = Modifier.testTag("message_info_dialog"),
+        title = { Text("Message info", fontWeight = FontWeight.ExtraBold) },
+        text = {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
+            ) {
+                // Sender header — photo/avatar + resolved name + raw number.
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    AvatarTile(
+                        label = senderName.take(1).uppercase(Locale.getDefault()),
+                        color = MaterialTheme.colorScheme.primary,
+                        size = 40.dp,
+                        corner = 12.dp,
+                        fontSize = 16.sp,
+                        photoUri = photoUriFor(info.sender)
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = senderName,
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                            color = MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        if (senderName != info.sender) {
+                            Text(
+                                text = info.sender,
+                                fontSize = 11.5.sp,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+                Spacer(modifier = Modifier.height(6.dp))
+                HorizontalDivider(color = MaterialTheme.colorScheme.outline)
+
+                InfoRow("Address / sender", info.sender)
+                InfoRow("Date received", date(info.dateReceived))
+                InfoRow("Date sent", date(info.dateSent))
+                InfoRow("Read", if (info.read) "Yes" else "No")
+                InfoRow("Seen", info.seen?.let { if (it) "Yes" else "No" } ?: NOT_AVAILABLE)
+                InfoRow("Thread ID", info.threadId?.toString() ?: NOT_AVAILABLE)
+                InfoRow("Status", info.statusLabel)
+                InfoRow(
+                    "Subscription (SIM)",
+                    info.subscriptionId?.let { "${info.simLabel} (sub $it)" } ?: info.simLabel
+                )
+                InfoRow("Service center", info.serviceCenter?.ifBlank { NOT_AVAILABLE } ?: NOT_AVAILABLE)
+                InfoRow("Protocol", info.protocol?.toString() ?: NOT_AVAILABLE)
+                InfoRow("Priority / error code", info.errorCode?.toString() ?: NOT_AVAILABLE)
+
+                if (!info.providerAvailable) {
+                    Spacer(modifier = Modifier.height(10.dp))
+                    Text(
+                        text = "Some fields are unavailable — this message has no system SMS " +
+                            "record, or SMS access is not granted.",
+                        fontSize = 11.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Close") }
+        }
+    )
+}
+
+private const val NOT_AVAILABLE = "Not available"
+
+/** One label/value line in the message-info sheet. */
+@Composable
+private fun InfoRow(label: String, value: String) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 7.dp),
+        verticalAlignment = Alignment.Top
+    ) {
+        Text(
+            text = label,
+            fontSize = 12.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.width(130.dp)
+        )
+        Spacer(modifier = Modifier.width(10.dp))
+        SelectionContainer(modifier = Modifier.weight(1f)) {
+            Text(
+                text = value,
+                fontSize = 12.5.sp,
+                fontWeight = FontWeight.Medium,
+                color = MaterialTheme.colorScheme.onSurface
+            )
+        }
+    }
+}
+
 @Composable
 fun MessageDetailScreen(viewModel: SmsOrganizerViewModel, msg: SMSMessage) {
     val context = LocalContext.current
@@ -3093,7 +3397,8 @@ fun MessageDetailScreen(viewModel: SmsOrganizerViewModel, msg: SMSMessage) {
                 .padding(start = 6.dp, end = 8.dp, top = 6.dp, bottom = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(
+            TooltipIconButton(
+                tooltip = "Back",
                 onClick = { viewModel.closeMessage() },
                 modifier = Modifier.testTag("detail_back_button")
             ) {
@@ -3214,12 +3519,16 @@ fun MessageDetailScreen(viewModel: SmsOrganizerViewModel, msg: SMSMessage) {
                             )
                         }
                     }
-                    Text(
-                        text = annotatedBody,
-                        fontSize = 13.5.sp,
-                        lineHeight = 21.sp,
-                        color = MaterialTheme.colorScheme.onBackground
-                    )
+                    // Selectable so part of a message (a link, a reference number) can be dragged
+                    // out with the system selection toolbar, not just copied whole.
+                    SelectionContainer {
+                        Text(
+                            text = annotatedBody,
+                            fontSize = 13.5.sp,
+                            lineHeight = 21.sp,
+                            color = MaterialTheme.colorScheme.onBackground
+                        )
+                    }
                 }
             }
             Row(
@@ -3284,6 +3593,41 @@ fun MessageDetailScreen(viewModel: SmsOrganizerViewModel, msg: SMSMessage) {
                     Icon(imageVector = Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(7.dp))
                     Text("Copy OTP ($otp)", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            // Copy / share the whole message body (below Copy OTP when there is one).
+            Spacer(modifier = Modifier.height(if (otp != null) 8.dp else 16.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                FilledTonalButton(
+                    onClick = {
+                        clipboardManager.setText(AnnotatedString(msg.body))
+                        Toast.makeText(context, "Message copied", Toast.LENGTH_SHORT).show()
+                    },
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(46.dp)
+                        .testTag("copy_message_button_${msg.id}"),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Icon(imageVector = Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(7.dp))
+                    Text("Copy", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                }
+                FilledTonalButton(
+                    onClick = { shareText(context, msg.body, "Share message") },
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(46.dp)
+                        .testTag("share_message_button_${msg.id}"),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Icon(imageVector = Icons.Default.Share, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(7.dp))
+                    Text("Share", fontSize = 13.sp, fontWeight = FontWeight.Bold)
                 }
             }
 
@@ -3827,7 +4171,7 @@ fun ContributionBreakdownScreen(viewModel: SmsOrganizerViewModel, kind: ContribK
                 .padding(start = 6.dp, end = 16.dp, top = 6.dp, bottom = 10.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(onClick = { viewModel.closeContribution() }) {
+            TooltipIconButton(tooltip = "Back", onClick = { viewModel.closeContribution() }) {
                 Icon(
                     imageVector = Icons.Default.ArrowBackIosNew,
                     contentDescription = "Back",
@@ -4029,7 +4373,8 @@ private fun ReminderDaysStepperRow(
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(2.dp)
         ) {
-            IconButton(
+            TooltipIconButton(
+                tooltip = "Decrease",
                 onClick = { onValueChange((value - 1).coerceAtLeast(minValue)) },
                 enabled = value > minValue
             ) {
@@ -4045,7 +4390,7 @@ private fun ReminderDaysStepperRow(
                 keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
                 modifier = Modifier.width(76.dp)
             )
-            IconButton(onClick = { onValueChange(value + 1) }) {
+            TooltipIconButton(tooltip = "Increase", onClick = { onValueChange(value + 1) }) {
                 Icon(Icons.Default.Add, contentDescription = "Increase")
             }
         }
@@ -4401,7 +4746,7 @@ fun SyncScreen(viewModel: SmsOrganizerViewModel) {
                                                 color = MaterialTheme.colorScheme.primary,
                                                 modifier = Modifier.weight(1f)
                                             )
-                                            IconButton(onClick = {
+                                            TooltipIconButton(tooltip = "Copy pairing code", onClick = {
                                                 clipboardManager.setText(AnnotatedString(formatPairingCode(state.code)))
                                                 Toast.makeText(context, "Pairing code copied", Toast.LENGTH_SHORT).show()
                                             }) {
@@ -4613,7 +4958,7 @@ fun SyncScreen(viewModel: SmsOrganizerViewModel) {
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text("One-time pairing code", fontSize = 13.sp, fontWeight = FontWeight.Bold)
-                        IconButton(onClick = {
+                        TooltipIconButton(tooltip = "Copy pairing code", onClick = {
                             clipboardManager.setText(AnnotatedString(formatPairingCode(pinValue)))
                             Toast.makeText(context, "Pairing code copied", Toast.LENGTH_SHORT).show()
                         }) {
@@ -5503,7 +5848,7 @@ private fun SubPageHeader(title: String, onBack: () -> Unit) {
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.fillMaxWidth().padding(top = 6.dp, bottom = 2.dp)
     ) {
-        IconButton(onClick = onBack) {
+        TooltipIconButton(tooltip = "Back", onClick = onBack) {
             Icon(
                 imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                 contentDescription = "Back",
@@ -6184,7 +6529,7 @@ private fun AdvancedSettingsPage(
                             )
                         }
 
-                        IconButton(onClick = { viewModel.removeRule(r.id) }) {
+                        TooltipIconButton(tooltip = "Delete", onClick = { viewModel.removeRule(r.id) }) {
                             Icon(imageVector = Icons.Default.Delete, contentDescription = "Delete", tint = MaterialTheme.colorScheme.error)
                         }
                     }
@@ -6672,7 +7017,7 @@ fun ComposeSmsDialog(
                                         color = Color(0xFF8C92AC)
                                     )
                                 }
-                                IconButton(onClick = { viewModel.cancelScheduled(s.id) }) {
+                                TooltipIconButton(tooltip = "Cancel scheduled message", onClick = { viewModel.cancelScheduled(s.id) }) {
                                     Icon(
                                         imageVector = Icons.Default.Close,
                                         contentDescription = "Cancel scheduled message"
@@ -6709,7 +7054,7 @@ fun ComposeSmsDialog(
                         .padding(horizontal = 4.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    IconButton(onClick = onDismiss) {
+                    TooltipIconButton(tooltip = "Back", onClick = onDismiss) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "Back",
@@ -6761,7 +7106,8 @@ fun ComposeSmsDialog(
                         )
                     }
                     
-                    IconButton(
+                    TooltipIconButton(
+                        tooltip = "Look up contact",
                         onClick = {
                             val hasPermission = androidx.core.content.ContextCompat.checkSelfPermission(
                                 context,
@@ -6980,7 +7326,8 @@ fun ComposeSmsDialog(
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 // Attachment Paperclip action button
-                                IconButton(
+                                TooltipIconButton(
+                                    tooltip = "Attach file",
                                     onClick = {
                                         Toast.makeText(context, "Attachment simulated: select image/doc", Toast.LENGTH_SHORT).show()
                                     },
@@ -6996,7 +7343,8 @@ fun ComposeSmsDialog(
 
                                 // Schedule Clock action button — opens a date+time picker, or
                                 // prompts to enable exact alarms if the OS hasn't granted them.
-                                IconButton(
+                                TooltipIconButton(
+                                    tooltip = "Schedule send",
                                     onClick = {
                                         if (viewModel.canScheduleExactAlarms()) {
                                             showScheduleDatePicker = true
@@ -7079,7 +7427,8 @@ fun ComposeSmsDialog(
                             val canSend = senderInput.trim().isNotEmpty() &&
                                 smsBodyInput.trim().isNotEmpty() &&
                                 viewModel.canSendSms
-                            IconButton(
+                            TooltipIconButton(
+                                tooltip = "Send",
                                 onClick = {
                                     if (canSend) {
                                         viewModel.sendSms(senderInput.trim(), smsBodyInput.trim(), selectedSimId)

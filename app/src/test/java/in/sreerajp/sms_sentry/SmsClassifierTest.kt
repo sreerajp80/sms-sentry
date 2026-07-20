@@ -226,6 +226,94 @@ class SmsClassifierTest {
         assertEquals(ref + 3 * 24 * 3600 * 1000L, result.dueDate)
     }
 
+    // ---- Spam scoring engine (weighted, sender-aware) --------------------------------------
+
+    @Test
+    fun `NPS investment statement is not Spam`() {
+        val result = SmsClassifier.classify(
+            sender = "VA-PTNNPS",
+            body = "Investment value in Tier I (PRANXX7618) as on 31.12.24 is Rs 1,94,742.82. " +
+                "For Benefits of e-statement click https://gs.im/PTNNPS/e/gVX8SoGLMYC - Protean",
+            customKeywords = noRules,
+            customContacts = emptyMap()
+        )
+        // "invest" must never match "Investment" as a substring, and PTNNPS is a trusted sender.
+        assertFalse("NPS statement must not be Spam", result.category == "Spam")
+    }
+
+    @Test
+    fun `SBI e-mandate alert is not Spam`() {
+        val result = SmsClassifier.classify(
+            sender = "VM-SBIBNK",
+            body = "Dear Customer, your e-mandate on SBI Debit card ending 8238 is active. " +
+                "Merchant: Amazon, Amount (Rs): 2.00, Frequency: annual.",
+            customKeywords = noRules,
+            customContacts = emptyMap()
+        )
+        assertFalse("SBI alert must not be Spam", result.category == "Spam")
+    }
+
+    @Test
+    fun `insurance policy expiry is a reminder, not Spam`() {
+        val result = SmsClassifier.classify(
+            sender = "VM-NIALTD",
+            body = "Dear Customer, Your MOTOR Policy No. 7601 will expire on 21/06/2026. " +
+                "You can renew the policy before then. Please ignore if already renewed. NIACL",
+            customKeywords = noRules,
+            customContacts = emptyMap(),
+            referenceTime = dateMillis("01 Jan 2026")
+        )
+        assertFalse("insurance renewal must not be Spam", result.category == "Spam")
+        assertTrue("renew/expire text should flag a reminder", result.isReminder)
+    }
+
+    @Test
+    fun `a real prize scam with link and urgency is Spam`() {
+        val result = SmsClassifier.classify(
+            sender = "VK-WINBIG",
+            body = "You won a lottery jackpot! Claim your prize at bit.ly/x now, hurry!",
+            customKeywords = noRules,
+            customContacts = emptyMap()
+        )
+        assertEquals("Spam", result.category)
+    }
+
+    @Test
+    fun `a trusted sender is not Spam over a single scam-ish word`() {
+        // One scam word (+3) is outweighed by the trusted-sender penalty (-5).
+        val result = SmsClassifier.classify(
+            sender = "VM-SBIBNK",
+            body = "Learn about crypto options with your SBI account.",
+            customKeywords = noRules,
+            customContacts = emptyMap()
+        )
+        assertFalse("trusted sender should dominate a lone scam word", result.category == "Spam")
+    }
+
+    @Test
+    fun `a lone shortened link is below the spam threshold`() {
+        val result = SmsClassifier.classify(
+            sender = "VM-XYZAB",
+            body = "Please update your details at bit.ly/abc to continue.",
+            customKeywords = noRules,
+            customContacts = emptyMap()
+        )
+        assertFalse("a single weak signal must not be Spam", result.category == "Spam")
+    }
+
+    @Test
+    fun `a user CONTACT to Spam rule still spams a trusted sender`() {
+        val result = SmsClassifier.classify(
+            sender = "VM-SBIBNK",
+            body = "Your account statement is ready.",
+            customKeywords = noRules,
+            customContacts = mapOf("VM-SBIBNK" to "Spam")
+        )
+        // Explicit user block rule outranks built-in sender trust.
+        assertEquals("Spam", result.category)
+        assertTrue(result.isBlocked)
+    }
+
     @Test
     fun `legacy rule target category is normalized to Others`() {
         val result = SmsClassifier.classify(

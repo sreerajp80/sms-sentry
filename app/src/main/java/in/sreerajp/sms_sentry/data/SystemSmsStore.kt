@@ -26,6 +26,82 @@ class SystemSmsStore(private val context: Context) {
         val threadId: Long?
     )
 
+    /**
+     * Extra per-message fields that live only in the system provider — not persisted in our own
+     * Room row. All are nullable: the column may be missing on old providers, or the whole read
+     * may fail (no `READ_SMS`), in which case the field is `null` and the UI shows "Not available".
+     *
+     * [status] uses the provider's own codes: -1 none, 0 complete, 32 pending, 64 failed.
+     */
+    data class SystemSmsDetails(
+        val dateReceived: Long?,
+        val dateSent: Long?,
+        val read: Boolean?,
+        val seen: Boolean?,
+        val threadId: Long?,
+        val status: Int?,
+        val subscriptionId: Int?,
+        val serviceCenter: String?,
+        val protocol: Int?,
+        val errorCode: Int?
+    )
+
+    /**
+     * Read the extended provider fields for a single SMS by its row id. Returns `null` when the
+     * row is gone, `READ_SMS` is not granted, or the query fails. Uses non-throwing column lookups
+     * because several of these columns are absent on older providers.
+     */
+    fun readDetails(systemId: Long): SystemSmsDetails? {
+        val projection = arrayOf(
+            Telephony.Sms.DATE,
+            Telephony.Sms.DATE_SENT,
+            Telephony.Sms.READ,
+            Telephony.Sms.SEEN,
+            Telephony.Sms.THREAD_ID,
+            Telephony.Sms.STATUS,
+            Telephony.Sms.SUBSCRIPTION_ID,
+            Telephony.Sms.SERVICE_CENTER,
+            Telephony.Sms.PROTOCOL,
+            Telephony.Sms.ERROR_CODE
+        )
+        val uri = Uri.withAppendedPath(Telephony.Sms.CONTENT_URI, systemId.toString())
+        return try {
+            context.contentResolver.query(uri, projection, null, null, null)?.use { c ->
+                if (!c.moveToFirst()) return null
+                fun longOrNull(col: String): Long? {
+                    val i = c.getColumnIndex(col)
+                    return if (i < 0 || c.isNull(i)) null else c.getLong(i)
+                }
+                fun intOrNull(col: String): Int? {
+                    val i = c.getColumnIndex(col)
+                    return if (i < 0 || c.isNull(i)) null else c.getInt(i)
+                }
+                fun stringOrNull(col: String): String? {
+                    val i = c.getColumnIndex(col)
+                    return if (i < 0 || c.isNull(i)) null else c.getString(i)
+                }
+                SystemSmsDetails(
+                    dateReceived = longOrNull(Telephony.Sms.DATE),
+                    dateSent = longOrNull(Telephony.Sms.DATE_SENT),
+                    read = intOrNull(Telephony.Sms.READ)?.let { it == 1 },
+                    seen = intOrNull(Telephony.Sms.SEEN)?.let { it == 1 },
+                    threadId = longOrNull(Telephony.Sms.THREAD_ID),
+                    status = intOrNull(Telephony.Sms.STATUS),
+                    subscriptionId = intOrNull(Telephony.Sms.SUBSCRIPTION_ID),
+                    serviceCenter = stringOrNull(Telephony.Sms.SERVICE_CENTER),
+                    protocol = intOrNull(Telephony.Sms.PROTOCOL),
+                    errorCode = intOrNull(Telephony.Sms.ERROR_CODE)
+                )
+            }
+        } catch (e: SecurityException) {
+            Log.w(TAG, "READ_SMS not granted; cannot read SMS details", e)
+            null
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to read SMS details id=$systemId", e)
+            null
+        }
+    }
+
     /** Read every SMS in the system provider (inbox + sent), newest first. */
     fun readAll(): List<SystemSmsRow> {
         val rows = mutableListOf<SystemSmsRow>()

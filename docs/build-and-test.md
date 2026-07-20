@@ -36,6 +36,31 @@ Instrumented tests are in `app/src/androidTest/`. There is no dependency-injecti
 tests construct `SmsOrganizerViewModel(application)` directly, which spins up the real Room DB and
 demo seed, so screenshot/UI tests exercise the full ingestion pipeline.
 
+### Unit tests need Java 21
+
+The SDK 36 system images Robolectric loads are Java 21 bytecode, so the test workers must run on
+Java 21 or newer — even though the app itself compiles to Java 17. `app/build.gradle.kts` pins
+this with a Gradle toolchain:
+
+```kotlin
+tasks.withType<Test>().configureEach {
+  javaLauncher.set(javaToolchains.launcherFor { languageVersion.set(JavaLanguageVersion.of(21)) })
+}
+```
+
+You do **not** need `JAVA_HOME` on 21 — the toolchain picks the JVM on its own. Gradle finds a
+local Java 21 via `org.gradle.java.installations.paths` in your user `~/.gradle/gradle.properties`
+(Android Studio's bundled JBR is a Java 21 and works), and otherwise downloads one through the
+`foojay-resolver-convention` plugin already applied in `settings.gradle.kts`.
+
+If you see this, the toolchain was bypassed — do not "fix" it by lowering `sdk` in `@Config`, and
+do not change the Robolectric version (4.16.1 supports SDK 36 fine):
+
+```
+java.lang.UnsupportedOperationException: Failed to create a Robolectric sandbox:
+    Android SDK 36 requires Java 21 (have Java 17)
+```
+
 ## Signing gotchas
 
 - **Both** debug and release builds are signed with the `sme` signing config, which reads

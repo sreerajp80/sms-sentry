@@ -38,6 +38,29 @@ data class ComposePrefill(val recipient: String, val body: String)
 /** Which side of the finance card was tapped to open the contribution breakdown. */
 enum class ContribKind { CREDIT, DEBIT }
 
+/**
+ * Display-ready details for the "Message info" sheet. Entity-backed fields are always present;
+ * provider-only fields ([dateSent], [seen], [subscriptionId], [serviceCenter], [protocol],
+ * [errorCode]) are `null` when the message has no system-provider row or `READ_SMS` is denied —
+ * the UI renders those as "Not available". [providerAvailable] is true when the live provider
+ * read succeeded.
+ */
+data class MessageInfo(
+    val sender: String,
+    val simLabel: String,
+    val dateReceived: Long,
+    val dateSent: Long?,
+    val read: Boolean,
+    val seen: Boolean?,
+    val threadId: Long?,
+    val statusLabel: String,
+    val subscriptionId: Int?,
+    val serviceCenter: String?,
+    val protocol: Int?,
+    val errorCode: Int?,
+    val providerAvailable: Boolean
+)
+
 class SmsOrganizerViewModel(application: Application) : AndroidViewModel(application) {
 
     private val db = SmsDatabase.getDatabase(application)
@@ -253,6 +276,60 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
     /** Re-enumerate active SIM subscriptions (call after a READ_PHONE_STATE grant / onResume). */
     fun refreshActiveSims() {
         _activeSims.value = SimManager.activeSubscriptions(getApplication())
+    }
+
+    /** Human SIM label for a 1-based slot: the carrier name when known, else "SIM N". */
+    private fun simLabelFor(simId: Int): String =
+        _activeSims.value.firstOrNull { it.slot == simId }?.displayLabel ?: "SIM $simId"
+
+    private fun ownStatusLabel(status: Int): String = when (status) {
+        SMSMessage.STATUS_SENDING -> "Sending"
+        SMSMessage.STATUS_SENT -> "Sent"
+        SMSMessage.STATUS_DELIVERED -> "Delivered"
+        SMSMessage.STATUS_FAILED -> "Failed"
+        else -> "None"
+    }
+
+    /** Provider delivery-report status codes (Telephony.Sms.STATUS_*). */
+    private fun providerStatusLabel(status: Int): String = when (status) {
+        0 -> "Complete"      // STATUS_COMPLETE
+        32 -> "Pending"      // STATUS_PENDING
+        64 -> "Failed"       // STATUS_FAILED
+        else -> "None"       // STATUS_NONE (-1) or unknown
+    }
+
+    /**
+     * Build the "Message info" model for [msg]. Entity fields are filled immediately; the
+     * provider-only fields are read off the main thread (needs `READ_SMS` and a non-null
+     * `systemId`). [onLoaded] is invoked once, on the main thread, with the final model.
+     */
+    fun loadMessageDetails(msg: SMSMessage, onLoaded: (MessageInfo) -> Unit) {
+        viewModelScope.launch {
+            val details = if (msg.systemId != null && hasReadSmsPermission()) {
+                withContext(Dispatchers.IO) { systemSmsStore.readDetails(msg.systemId) }
+            } else null
+
+            val statusLabel = details?.status?.let { providerStatusLabel(it) }
+                ?: ownStatusLabel(msg.status)
+
+            onLoaded(
+                MessageInfo(
+                    sender = msg.sender,
+                    simLabel = simLabelFor(msg.simId),
+                    dateReceived = details?.dateReceived ?: msg.timestamp,
+                    dateSent = details?.dateSent,
+                    read = details?.read ?: msg.isRead,
+                    seen = details?.seen,
+                    threadId = details?.threadId ?: msg.threadId,
+                    statusLabel = statusLabel,
+                    subscriptionId = details?.subscriptionId,
+                    serviceCenter = details?.serviceCenter,
+                    protocol = details?.protocol,
+                    errorCode = details?.errorCode,
+                    providerAvailable = details != null
+                )
+            )
+        }
     }
 
     /**
