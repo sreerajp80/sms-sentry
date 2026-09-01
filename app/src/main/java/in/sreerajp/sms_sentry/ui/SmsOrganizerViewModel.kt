@@ -192,6 +192,12 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
     private val _contactPhotos = MutableStateFlow<Map<String, Uri>>(emptyMap())
     val contactPhotos: StateFlow<Map<String, Uri>> = _contactPhotos.asStateFlow()
 
+    // Resolved conversation keys for senders (sender -> conversation grouping key).
+    // For saved contacts, this is e.g. "contact:<lookupKey>" or "contact:<contactId>".
+    // For non-contacts, it falls back to the sender itself.
+    private val _contactKeys = MutableStateFlow<Map<String, String>>(emptyMap())
+    val contactKeys: StateFlow<Map<String, String>> = _contactKeys.asStateFlow()
+
     // Contact suggestions from the address book matching the active query in Compose
     private val _contactSuggestions = MutableStateFlow<List<ContactNameResolver.ContactSuggestion>>(emptyList())
     val contactSuggestions: StateFlow<List<ContactNameResolver.ContactSuggestion>> = _contactSuggestions.asStateFlow()
@@ -246,6 +252,8 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
         _contactPhotos.value = resolved
             .mapNotNull { (sender, info) -> info.photoUri?.let { sender to it } }
             .toMap()
+        _contactKeys.value = resolved
+            .mapValues { (sender, info) -> info.conversationKey(sender) }
     }
 
     /** Clear cached resolutions and re-resolve current senders (e.g. after a READ_CONTACTS grant). */
@@ -577,12 +585,25 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
+    // --- Conversation grouping & multi-number helpers ---
+    fun conversationKeyFor(sender: String): String =
+        _contactKeys.value[sender] ?: sender
+
+    /** Returns all known phone numbers/senders belonging to the given conversation key or sender. */
+    fun sendersForConversation(threadKeyOrSender: String): Set<String> {
+        val matching = _contactKeys.value.entries
+            .filter { it.value == threadKeyOrSender || it.key == threadKeyOrSender }
+            .map { it.key }
+            .toSet()
+        return if (matching.isEmpty()) setOf(threadKeyOrSender) else matching
+    }
+
     // --- Conversation thread navigation ---
     fun openThread(sender: String) { openedThread.value = sender }
     fun closeThread() { openedThread.value = null }
 
     /**
-     * If [recipient] already has a conversation, return that thread's canonical sender key;
+     * If [recipient] already has a conversation, return that thread's canonical sender or conversation key;
      * otherwise null. Lets the composer fold a new message into an existing thread instead of
      * staying a separate "New message" screen. Phone numbers match on their trailing digits so
      * `9496135390`, `+91 94961 35390`, etc. resolve to the same thread; alphanumeric sender IDs
@@ -591,6 +612,12 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
     fun existingThreadFor(recipient: String): String? {
         val needle = recipient.trim()
         if (needle.isBlank()) return null
+        val directKey = _contactKeys.value[needle]
+        if (directKey != null) {
+            val senders = sendersForConversation(directKey)
+            val hasMsgs = allMessages.value.any { it.sender in senders || conversationKeyFor(it.sender) == directKey }
+            if (hasMsgs) return directKey
+        }
         val byNumber = ContactNameResolver.isPhoneNumberLike(needle)
         val needleTail = if (byNumber) digitsTail(needle) else ""
         return allMessages.value.asSequence()
@@ -602,7 +629,7 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
                 } else {
                     sender.trim().equals(needle, ignoreCase = true)
                 }
-            }
+            }?.let { conversationKeyFor(it) }
     }
 
     /** Digits of [s] only, keeping the trailing 10 (or all when shorter) for number comparison. */
@@ -684,10 +711,11 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
     }
 
     // --- Block / Report / Delete from the card or detail screen ---
-    /** Delete every message from a sender (the whole conversation), syncing to the provider. */
-    fun deleteConversation(sender: String) {
+    /** Delete every message from a sender or conversation group, syncing to the provider. */
+    fun deleteConversation(senderOrKey: String) {
         viewModelScope.launch {
-            val msgs = allMessages.value.filter { it.sender == sender }
+            val senders = sendersForConversation(senderOrKey)
+            val msgs = allMessages.value.filter { it.sender in senders || conversationKeyFor(it.sender) == senderOrKey }
             for (m in msgs) {
                 deleteFromSystemIfDefault(m)
                 repository.deleteMessage(m)
@@ -695,20 +723,22 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
-    /** Mark every message from a sender as read. */
-    fun markConversationRead(sender: String) {
+    /** Mark every message from a sender or conversation group as read. */
+    fun markConversationRead(senderOrKey: String) {
         viewModelScope.launch {
+            val senders = sendersForConversation(senderOrKey)
             allMessages.value
-                .filter { it.sender == sender && !it.isRead }
+                .filter { (it.sender in senders || conversationKeyFor(it.sender) == senderOrKey) && !it.isRead }
                 .forEach { repository.markAsRead(it.id) }
         }
     }
 
-    /** Mark every inbound message from a sender as unread (manual override). */
-    fun markConversationUnread(sender: String) {
+    /** Mark every inbound message from a sender or conversation group as unread (manual override). */
+    fun markConversationUnread(senderOrKey: String) {
         viewModelScope.launch {
+            val senders = sendersForConversation(senderOrKey)
             allMessages.value
-                .filter { it.sender == sender && it.isRead && it.type == SMSMessage.TYPE_INBOX }
+                .filter { (it.sender in senders || conversationKeyFor(it.sender) == senderOrKey) && it.isRead && it.type == SMSMessage.TYPE_INBOX }
                 .forEach { repository.markAsUnread(it.id) }
         }
     }
@@ -723,12 +753,15 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
         viewModelScope.launch { ids.forEach { repository.markAsUnread(it) } }
     }
 
-    /** Block a sender (add a CONTACT->Spam rule) and clear their current conversation. */
-    fun blockConversation(sender: String) {
+    /** Block a sender or conversation group (add a CONTACT->Spam rule for each number) and clear their messages. */
+    fun blockConversation(senderOrKey: String) {
         viewModelScope.launch {
-            repository.addRule("CONTACT", sender, "Spam")
+            val senders = sendersForConversation(senderOrKey)
+            for (s in senders) {
+                repository.addRule("CONTACT", s, "Spam")
+            }
         }
-        deleteConversation(sender)
+        deleteConversation(senderOrKey)
     }
 
     /** Report as spam: move the message to the Spam folder and remember the sender. */
@@ -739,26 +772,32 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
-    /** Report a whole conversation as spam: move every message from the sender to Spam + remember it. */
-    fun reportSpamSender(sender: String) {
+    /** Report a whole conversation as spam: move every message to Spam + remember the sender(s). */
+    fun reportSpamSender(senderOrKey: String) {
         viewModelScope.launch {
-            val msgs = allMessages.value.filter { it.sender == sender }
+            val senders = sendersForConversation(senderOrKey)
+            val msgs = allMessages.value.filter { it.sender in senders || conversationKeyFor(it.sender) == senderOrKey }
             for (m in msgs) {
                 repository.reportSpam(m)
             }
-            repository.addRule("CONTACT", sender, "Spam")
+            for (s in senders) {
+                repository.addRule("CONTACT", s, "Spam")
+            }
         }
     }
 
     /**
-     * Move a whole conversation out of spam: allowlist the sender (so future messages aren't
+     * Move a whole conversation out of spam: allowlist the sender(s) (so future messages aren't
      * auto-spammed) and then re-classify each of their existing Spam messages. Reverse of
      * [reportSpamSender].
      */
-    fun markNotSpamSender(sender: String) {
+    fun markNotSpamSender(senderOrKey: String) {
         viewModelScope.launch {
-            repository.allowlistSender(sender)
-            val msgs = allMessages.value.filter { it.sender == sender && it.category == "Spam" }
+            val senders = sendersForConversation(senderOrKey)
+            for (s in senders) {
+                repository.allowlistSender(s)
+            }
+            val msgs = allMessages.value.filter { (it.sender in senders || conversationKeyFor(it.sender) == senderOrKey) && it.category == "Spam" }
             for (m in msgs) {
                 repository.restoreFromSpam(m)
             }
@@ -766,30 +805,39 @@ class SmsOrganizerViewModel(application: Application) : AndroidViewModel(applica
     }
 
     /**
-     * Manually move a whole conversation (every message from [sender]) into [targetCategory]
+     * Manually move a whole conversation (every message from [senderOrKey]) into [targetCategory]
      * (Personal / Promotions / Others / Spam), a user override of the classifier. Moving to Spam
-     * also adds a CONTACT->Spam rule so the sender's future messages are auto-spammed, but the
+     * also adds a CONTACT->Spam rule so future messages are auto-spammed, but the
      * existing messages stay visible in the Spam folder (it does NOT delete the conversation,
      * unlike [blockConversation]).
      */
-    fun moveConversationToCategory(sender: String, targetCategory: String) {
+    fun moveConversationToCategory(senderOrKey: String, targetCategory: String) {
         viewModelScope.launch {
-            val msgs = allMessages.value.filter { it.sender == sender }
+            val senders = sendersForConversation(senderOrKey)
+            val msgs = allMessages.value.filter { it.sender in senders || conversationKeyFor(it.sender) == senderOrKey }
             for (m in msgs) {
                 repository.moveMessageToCategory(m, targetCategory)
             }
             if (targetCategory == "Spam") {
-                repository.addRule("CONTACT", sender, "Spam")
+                for (s in senders) {
+                    repository.addRule("CONTACT", s, "Spam")
+                }
             }
         }
     }
 
-    // --- Mute notifications for a sender ---
-    fun isMuted(sender: String): Boolean = mutedSenders.value.contains(sender)
+    // --- Mute notifications for a sender or conversation group ---
+    fun isMuted(senderOrKey: String): Boolean {
+        if (mutedSenders.value.contains(senderOrKey)) return true
+        val senders = sendersForConversation(senderOrKey)
+        return senders.isNotEmpty() && senders.all { mutedSenders.value.contains(it) }
+    }
 
-    fun toggleMute(sender: String) {
+    fun toggleMute(senderOrKey: String) {
+        val senders = sendersForConversation(senderOrKey) + senderOrKey
+        val willMute = !isMuted(senderOrKey)
         val next = mutedSenders.value.toMutableSet().apply {
-            if (!add(sender)) remove(sender)
+            if (willMute) addAll(senders) else removeAll(senders)
         }
         mutedSenders.value = next
         prefs.edit().putStringSet("muted_senders", next).apply()

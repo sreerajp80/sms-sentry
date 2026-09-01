@@ -52,4 +52,17 @@ class OtpDetectorTest {
         assertNull(detectOtp("Please call me at 987654 or visit room 1024."))
         assertNull(detectOtp("The total cost is 5000 dollars."))
     }
+
+    @Test
+    fun testDetectOtpGoogleFormat() {
+        assertEquals("984210", detectOtp("G-984210 is your Google verification code."))
+        assertEquals("748291", detectOtp("Your Google verification code is G-748291. Do not share it."))
+    }
+
+    @Test
+    fun testDetectOtpMalayalamKeywords() {
+        assertEquals("543210", detectOtp("നിങ്ങളുടെ ലോഗിൻ ഒ.ടി.പി 543210 ആണ്. ഇത് ആരുമായും പങ്കിടരുത്."))
+        assertEquals("654321", detectOtp("നിങ്ങളുടെ രഹസ്യകോഡ് 654321 നൽകുക."))
+        assertEquals("123456", detectOtp("പാസ്‌വേഡ് മാറ്റുന്നതിനുള്ള ഒ.ടി.പി 123456 ആകുന്നു."))
+    }
 }

@@ -1,6 +1,6 @@
-# CLAUDE.md — SMS Sentry
+# AGENTS.md — SMS Sentry
 
-This file is read by Claude Code at the start of every session in this repository.
+This file is read by AI agents and LLM coding assistants (Gemini, Antigravity, Cursor, Windsurf, Codex, etc.) at the start of every session in this repository.
 Read it before making any change. See the docs table below for full detail.
 
 ---
@@ -66,7 +66,7 @@ import `in`.sreerajp.sms_sentry.data.SmsRepository
 
 ## Architecture rules
 
-- **Layout:** Single-module MVVM under `app/src/main/java/in/sreerajp/sms_sentry/` — packages: `config/`, `data/`, `engine/`, `receiver/`, `ui/`, `util/`, `MainActivity.kt`.
+- **Layout:** Single-module MVVM under `app/src/main/java/in/sreerajp/sms_sentry/` — packages: `config/`, `data/`, `engine/`, `receiver/`, `service/`, `sync/`, `ui/`, `util/`, `MainActivity.kt`.
 - **Layer boundaries:** Composables must not directly perform database operations or access raw content resolvers. Always route through `SmsOrganizerViewModel` and `SmsRepository`.
 - **State:** UI consumes `StateFlow` from `SmsOrganizerViewModel`. State transitions are explicit.
 - **Models:** Room entities and domain models are immutable data classes (`copy()`).
@@ -125,8 +125,8 @@ For running a single test:
 ## Where things live
 
 ```
-CLAUDE.md            # this file — project rules
-AGENTS.md            # project rules for AI agents / LLMs
+AGENTS.md            # this file — project rules for AI agents / LLMs
+CLAUDE.md            # Claude Code native project rules
 docs/                # design docs & guidelines manifest
 docs/guidelines/     # shared Kotlin guidelines submodule
 plans/               # one plan per change (see workflow rules)
@@ -167,10 +167,10 @@ Create `plans/` and `change_log/` if they do not exist.
 
 ---
 
-## What Claude must always / never do
+## What AI agents must always / never do
 
 **Always:**
-- Read `CLAUDE.md` and `AGENTS.md` before making changes.
+- Read `AGENTS.md` and `CLAUDE.md` before making changes.
 - Follow the plan-before-changing and log-after-changing workflow.
 - Route all message insertion through `SmsRepository.processAndInsertMessage()`.
 - Use relative repository paths only in plans and logs.

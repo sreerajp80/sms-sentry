@@ -1,0 +1,12 @@
+{
+  "appName": "SMS Sentry",
+  "description": "Offline SMS organizer, classifier, finance ledger, and reminder tracker.",
+  "version": "16.13",
+  "build": "18",
+  "details": {
+    "Author": "Sreeraj P",
+    "IDE used": "Android Studio, Visual Studio Code",
+    "AI used": "Claude (Claude Code), Gemini 3.5 Flash",
+    "License": "All libraries used are open source."
+  }
+}

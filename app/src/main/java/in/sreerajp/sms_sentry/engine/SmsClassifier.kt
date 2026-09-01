@@ -39,14 +39,19 @@ object SmsClassifier {
         "claim your prize", "claim your reward", "claim your gift", "free bonus", "lucky winner",
         "lucky draw", "selected winner", "guaranteed returns", "double your money", "get rich",
         "work from home", "earn money", "earn daily", "part time job", "loan approved",
-        "pre-approved loan", "kyc suspended", "account suspended", "crypto", "bitcoin"
+        "pre-approved loan", "kyc suspended", "account suspended", "crypto", "bitcoin",
+        "electricity will be disconnected", "power will be disconnected", "electricity power will be cut",
+        "download apk", "install apk", ".apk", "pan card blocked", "sim blocked", "sim deactivated",
+        "aadhaar suspended", "debit card blocked", "telegram task", "daily income", "earn daily income",
+        "whatsapp job", "contact on whatsapp"
     )
 
     // URL shorteners commonly used to hide scam landing pages. Weak on their own (+[LINK_WEIGHT]);
     // matched as plain substrings since these tokens are distinctive.
     private const val LINK_WEIGHT = 1
     private val URL_SHORTENERS = listOf(
-        "bit.ly", "tinyurl", "goo.gl", "t.co/", "is.gd", "cutt.ly", "rb.gy", "tiny.cc", "ow.ly"
+        "bit.ly", "tinyurl", "goo.gl", "t.co/", "is.gd", "cutt.ly", "rb.gy", "tiny.cc", "ow.ly",
+        "wa.me/", "t.me/", "bit.do", "v.gd", "s.id", "qr.ae", "shorturl.at"
     )
 
     // High-pressure urgency cues. Weak on their own (+[URGENCY_WEIGHT]); meaningful only when
@@ -54,7 +59,8 @@ object SmsClassifier {
     private const val URGENCY_WEIGHT = 1
     private val URGENCY_PHRASES = listOf(
         "act now", "hurry", "last chance", "expires today", "don't miss", "dont miss",
-        "urgent", "immediately", "limited seats", "offer ends"
+        "urgent", "immediately", "limited seats", "offer ends", "immediate action required",
+        "within 24 hours", "account will be closed", "action required"
     )
 
     // Known legitimate bulk senders (banks, pensions, insurers, govt, telecom). A DLT header
@@ -65,7 +71,9 @@ object SmsClassifier {
     private val TRUSTED_ENTITIES = listOf(
         // Banks
         "HDFC", "SBIBNK", "SBI", "ICICI", "AXIS", "HSBC", "CITI", "KOTAK", "PNB", "BOI",
-        "YESBK", "INDUS", "CANBNK", "UNIONB", "IDFC", "RBLBNK",
+        "YESBK", "INDUS", "CANBNK", "CANARA", "UNIONB", "UNION", "IDFC", "IDFCFIRST",
+        "RBLBNK", "RBL", "FEDERAL", "FEDBNK", "IOB", "IOBBNK", "CBI", "PAYTM", "PAYTMBK",
+        "AIRTEL", "AIRPBNK", "IPPB", "BANDHAN", "BOB", "BARODA", "SCB", "STANCHAR",
         // NPS / pensions
         "PTNNPS", "NPSCRA", "PROTEAN", "NSDL", "PFRDA", "CAMSKRA",
         // Insurers
@@ -79,9 +87,11 @@ object SmsClassifier {
     // message is not spam even if it happens to use a strong-sounding word.
     private const val CONTEXT_WEIGHT = 2
     private val LEGIT_CONTEXT_KEYWORDS = listOf(
-        "debited", "credited", "a/c", "account", "available bal", "avail bal", "balance",
-        "statement", "policy", "premium", "otp", "one time password", "transaction", "txn",
-        "e-mandate", "mandate", "installment", "investment value", "portfolio", "tier i", "tier ii"
+        "debited", "credited", "a/c", "account", "available bal", "avail bal", "avl bal", "avl balance",
+        "balance", "net bal", "clear bal", "updated bal", "statement", "policy", "premium", "otp",
+        "one time password", "transaction", "txn", "e-mandate", "mandate", "installment", "investment value",
+        "portfolio", "tier i", "tier ii", "deducted", "charged", "withdrawal", "deposited", "auto-debited",
+        "auto debited"
     )
 
     // Boundary-anchored patterns for the scam/urgency phrases, compiled once. "\b…\b" prevents
@@ -101,8 +111,10 @@ object SmsClassifier {
 
     // Money-movement tags → flags the message as finance (ledger), category becomes "Others".
     private val MONEY_KEYWORDS = listOf(
-        "debited", "credited", "spent", "withdrawn", "withdrew", "paid", "received", "transfer",
-        "txn", "transaction", "a/c balance", "available bal", "bank", "payment of"
+        "debited", "credited", "spent", "withdrawn", "withdrew", "withdrawal", "paid", "received", "transfer",
+        "transferred", "txn", "transaction", "a/c balance", "available bal", "avail bal", "avl bal",
+        "avl balance", "net bal", "bank", "payment of", "deducted", "charged", "auto-debited",
+        "auto debited", "deposited", "deposit", "spent on", "added to wallet", "paid to", "paid via"
     )
 
     // Reminder tags → flags the message as a reminder (due dates), category becomes "Others".
@@ -112,7 +124,7 @@ object SmsClassifier {
         "due on", "due date", "due by", "payment due", "pay by", "last date", "bill due",
         "outstanding", "overdue", "expires on", "expiring", "expiry", "valid till",
         "valid until", "validity", "renew", "renewal", "recharge before", "appointment",
-        "reminder", "kindly pay", "please pay"
+        "reminder", "kindly pay", "please pay", "pay before", "pay bill"
     )
 
     // Strong, unambiguous "you must do something by a date" phrases. Used to override the
@@ -122,7 +134,7 @@ object SmsClassifier {
         "due on", "due date", "due by", "payment due", "pay by", "last date", "bill due",
         "outstanding", "overdue", "expires on", "expiring", "expiry", "valid till",
         "valid until", "validity", "renew", "renewal", "recharge before", "kindly pay",
-        "please pay"
+        "please pay", "pay before", "pay bill"
     )
 
     // Completed-transaction / receipt markers. When one of these is present and there is no
@@ -145,36 +157,37 @@ object SmsClassifier {
     private val SERVICES_KEYWORDS = listOf(
         "otp", "one time password", "verification code", "verify", "delivered",
         "out for delivery", "shipped", "dispatched", "order", "booking", "booked",
-        "ticket", "confirmed", "recharge"
+        "ticket", "confirmed", "recharge", "pnr", "boarding", "flight", "train",
+        "tracking", "service request", "ticket no"
     )
 
     // Regex compiled for speed.
-    // A currency-tagged number anywhere in the body. The Indian `/-` suffix and `13,97,889`
-    // grouping are tolerated: the trailing `/-` is outside the captured group and commas are
-    // stripped before parsing.
+    // A currency-tagged number anywhere in the body. Prefix currency ("Rs. 500", "INR 1,200", "₹50")
+    // and suffix currency ("500 Rs", "1000 INR") are supported with optional colon/dash delimiters.
+    // Indian grouping ('13,97,889') and trailing '/-' are tolerated.
     private val currencyRegex = Pattern.compile(
-        "(?:rs\\.?|inr|₹|\\$|usd)\\s*([\\d,]+(?:\\.\\d{1,2})?)",
+        "(?:(?:rs\\.?|inr\\.?|₹|\\$|usd|eur|€|gbp|£)\\s*[:\\-]?\\s*([\\d,]+(?:\\.\\d{1,2})?))|([\\d,]+(?:\\.\\d{1,2})?)\\s*(?:rs\\.?|inr\\.?|₹|\\$|usd|eur|€|gbp|£)",
         Pattern.CASE_INSENSITIVE
     )
     // Balance context keyword; the balance figure is the first currency number that follows it.
     private val balanceKeywordRegex = Pattern.compile(
-        "avail(?:able)?\\.?\\s*bal(?:ance)?|a/c\\s*bal(?:ance)?|closing\\s*bal(?:ance)?|bal(?:ance)?",
+        "avail(?:able)?\\.?\\s*bal(?:ance)?|avl\\.?\\s*bal(?:ance)?|a/c\\s*bal(?:ance)?|closing\\s*bal(?:ance)?|net\\s*bal(?:ance)?|clear\\s*bal(?:ance)?|updated\\s*bal(?:ance)?|total\\s*bal(?:ance)?|bal(?:ance)?",
         Pattern.CASE_INSENSITIVE
     )
     // Money-movement verbs; used both to detect direction and to locate the transaction amount.
     private val movementRegex = Pattern.compile(
-        "credited|debited|spent|withdrawn|withdrew|paid|sent|received|contribution|transferred|purchase|refunded|refund|deposited|deposit",
+        "credited|debited|spent|withdrawn|withdrew|withdrawal|paid|sent|received|contribution|transferred|purchase|refunded|refund|deposited|deposit|deducted|charged|auto-debited|auto debited",
         Pattern.CASE_INSENSITIVE
     )
-    // Movement verbs that mean money came IN. Anything else (debited/spent/paid/…) is a debit.
+    // Movement verbs that mean money came IN. Anything else (debited/spent/paid/deducted/…) is a debit.
     private val creditWords = setOf("credited", "received", "contribution", "refunded", "refund", "deposited", "deposit")
 
     // Simple date extractors.
-    // Date separator characters: ASCII space/dot/slash/hyphen PLUS the Unicode dashes that
+    // Date separator characters: ASCII space/dot/slash/hyphen/comma PLUS the Unicode dashes that
     // bulk SMS (e.g. MoRTH/government senders) often use instead of an ASCII hyphen —
     // non-breaking hyphen (U+2011), figure dash (U+2012), en dash (U+2013), em dash (U+2014),
-    // and minus sign (U+2212). Without these, "16–Jun–2026" (en dash) fails to match.
-    private const val DATE_SEP = "\\s./\\-\\u2011\\u2012\\u2013\\u2014\\u2212"
+    // and minus sign (U+2212).
+    private const val DATE_SEP = "\\s./\\-,\\u2011\\u2012\\u2013\\u2014\\u2212"
     // ISO yyyy-MM-dd (e.g. "validity is 2027-06-12"). Matched first so the 4-digit year is not
     // mistaken for a DD-MM-YY date by dateRegex1 (which would turn 2027-06-12 into 27-06-12).
     private val isoDateRegex = Pattern.compile(
@@ -183,10 +196,14 @@ object SmsClassifier {
     private val dateRegex1 = Pattern.compile(
         "(\\d{1,2}[$DATE_SEP]\\d{1,2}[$DATE_SEP]\\d{2,4})" // DD-MM-YYYY or DD/MM/YY
     )
-    // Alpha month with flexible separators: "16 Jun 2026", "16-Jun-2026", "16–Jun–2026" (en dash),
-    // "16.Jun.2026", "16/Jun/2026" all match. Separators are normalized to spaces before parsing.
-    private val dateRegex2 = Pattern.compile(
-        "(\\d{1,2}[$DATE_SEP]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[$DATE_SEP]*\\d{0,4})",
+    // Alpha month with flexible separators, supporting both day-first ("16 Jun 2026", "25th May",
+    // "16–Jun–2026") and month-first ("May 25, 2026", "June 16") formats.
+    private val dateRegexAlphaDayFirst = Pattern.compile(
+        "(\\b\\d{1,2}(?:st|nd|rd|th)?[$DATE_SEP]+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[$DATE_SEP]*\\d{0,4}\\b)",
+        Pattern.CASE_INSENSITIVE
+    )
+    private val dateRegexAlphaMonthFirst = Pattern.compile(
+        "(\\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[$DATE_SEP]+\\d{1,2}(?:st|nd|rd|th)?(?:[$DATE_SEP]+\\d{2,4})?\\b)",
         Pattern.CASE_INSENSITIVE
     )
 
@@ -388,10 +405,14 @@ object SmsClassifier {
                 parseDate(matcher1.group(1) ?: "")?.let { candidates.add(it) }
             }
 
-            // Alpha month format (e.g., 25 May, 16-Jun-2026).
-            val matcher2 = dateRegex2.matcher(body)
+            // Alpha month format with day-first or month-first (e.g., 25th May 2026, May 25 2026, 16-Jun-2026).
+            val matcher2 = dateRegexAlphaDayFirst.matcher(body)
             while (matcher2.find()) {
                 parseAlphaDate(matcher2.group(1) ?: "", referenceTime)?.let { candidates.add(it) }
+            }
+            val matcher3 = dateRegexAlphaMonthFirst.matcher(body)
+            while (matcher3.find()) {
+                parseAlphaDate(matcher3.group(1) ?: "", referenceTime)?.let { candidates.add(it) }
             }
 
             // Reckon "future"/"past" and the fallback relative to the message's own time so
@@ -448,7 +469,8 @@ object SmsClassifier {
         val hits = mutableListOf<CurrencyHit>()
         val cm = currencyRegex.matcher(body)
         while (cm.find()) {
-            val v = cm.group(1)?.replace(",", "")?.toDoubleOrNull()
+            val numStr = cm.group(1) ?: cm.group(2)
+            val v = numStr?.replace(",", "")?.toDoubleOrNull()
             if (v != null) hits.add(CurrencyHit(v, cm.start(), cm.end()))
         }
         if (hits.isEmpty()) return FinanceFields(null, null, null)
@@ -500,9 +522,19 @@ object SmsClassifier {
         val uppercaseSender = sender.uppercase(Locale.ROOT)
         // Common banking sender headers have names, e.g., "VM-HDFCBK"
         val cleanSender = uppercaseSender.replace(Regex("[^A-Z]"), "")
-        val knownBanks = listOf("HDFC", "SBI", "ICICI", "AXIS", "HSBC", "CITI", "CHASE", "BOFA", "KOTAK", "PNB", "BOI", "YESBK", "INDUS")
+        val knownBanks = listOf(
+            "HDFC", "SBIBNK", "SBI", "ICICI", "AXIS", "HSBC", "CITI", "CHASE", "BOFA", "KOTAK", "PNB", "BOI",
+            "YESBK", "INDUS", "CANBNK", "CANARA", "UNIONB", "UNION", "IDFCFIRST", "IDFC",
+            "RBLBNK", "RBL", "FEDBNK", "FEDERAL", "IOBBNK", "IOB", "CBI", "PAYTMBK", "PAYTM",
+            "AIRPBNK", "AIRTEL", "IPPB", "BANDHAN", "BARODA", "BOB", "STANCHAR", "SCB"
+        )
         for (bk in knownBanks) {
-            if (cleanSender.contains(bk) || body.contains(bk, ignoreCase = true)) {
+            if (cleanSender.contains(bk)) {
+                return bk
+            }
+        }
+        for (bk in knownBanks) {
+            if (body.contains(bk, ignoreCase = true)) {
                 return bk
             }
         }
@@ -533,15 +565,21 @@ object SmsClassifier {
     }
 
     private fun parseAlphaDate(dateStr: String, referenceTime: Long = System.currentTimeMillis()): Long? {
-        // Normalize hyphen/dot/slash/Unicode-dash separators to spaces so "16-Jun-2026" and
-        // "16–Jun–2026" (en dash) parse with the space-delimited format list (covers
-        // "16 Jun 2026", "16.Jun.2026", "16/Jun/2026" too).
-        val normalized = dateStr.replace(Regex("[$DATE_SEP]+"), " ").trim()
-        val formats = listOf("dd MMM yyyy", "dd MMM", "d MMM yyyy", "d MMM")
+        // Strip ordinal suffixes (e.g., 25th -> 25, 1st -> 1, 2nd -> 2, 3rd -> 3)
+        val cleaned = dateStr.replace(Regex("(?i)(\\d+)(?:st|nd|rd|th)"), "$1")
+        // Normalize hyphen/dot/slash/comma/Unicode-dash separators to spaces so "16-Jun-2026" and
+        // "16–Jun–2026" (en dash) parse with the space-delimited format list.
+        val normalized = cleaned.replace(Regex("[$DATE_SEP]+"), " ").trim()
+        val formats = listOf(
+            "dd MMM yyyy", "dd MMMM yyyy", "d MMM yyyy", "d MMMM yyyy",
+            "dd MMM", "dd MMMM", "d MMM", "d MMMM",
+            "MMM dd yyyy", "MMMM dd yyyy", "MMM d yyyy", "MMMM d yyyy",
+            "MMM dd", "MMMM dd", "MMM d", "MMMM d"
+        )
         val referenceYear = Calendar.getInstance().apply { timeInMillis = referenceTime }.get(Calendar.YEAR)
         for (f in formats) {
             try {
-                val sdf = SimpleDateFormat(f, Locale.ROOT)
+                val sdf = SimpleDateFormat(f, Locale.ENGLISH)
                 sdf.isLenient = false
                 val date = sdf.parse(normalized)
                 if (date != null) {

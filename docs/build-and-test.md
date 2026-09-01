@@ -31,7 +31,7 @@ Java 11, Compose BOM.
 ```
 
 JVM unit tests live in `app/src/test/` and run on **Robolectric** (`@Config sdk = [36]`), with
-**Roborazzi** for Compose screenshot tests (e.g. [../app/src/test/java/com/example/GreetingScreenshotTest.kt](../app/src/test/java/com/example/GreetingScreenshotTest.kt)).
+**Roborazzi** for Compose screenshot tests (e.g. [../app/src/test/java/in/sreerajp/sms_sentry/GreetingScreenshotTest.kt](../app/src/test/java/in/sreerajp/sms_sentry/GreetingScreenshotTest.kt)).
 Instrumented tests are in `app/src/androidTest/`. There is no dependency-injection framework —
 tests construct `SmsOrganizerViewModel(application)` directly, which spins up the real Room DB and
 demo seed, so screenshot/UI tests exercise the full ingestion pipeline.

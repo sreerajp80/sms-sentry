@@ -17,7 +17,25 @@ import java.util.concurrent.ConcurrentHashMap
 object ContactNameResolver {
 
     /** A contact lookup result. [name] falls back to the raw sender on a miss; [photoUri] is null then. */
-    data class ContactInfo(val name: String, val photoUri: Uri?)
+    data class ContactInfo(
+        val name: String,
+        val photoUri: Uri?,
+        val lookupKey: String? = null,
+        val contactId: Long? = null
+    ) {
+        /**
+         * Returns a unique conversation grouping key for this contact.
+         * If the contact was resolved from the address book, returns a contact-scoped key
+         * (e.g. `contact:<lookupKey>` or `contact:<contactId>`).
+         * Otherwise falls back to [fallbackSender].
+         */
+        fun conversationKey(fallbackSender: String): String =
+            when {
+                !lookupKey.isNullOrBlank() -> "contact:$lookupKey"
+                contactId != null -> "contact:$contactId"
+                else -> fallbackSender
+            }
+    }
 
     // sender -> info. A miss stores ContactInfo(sender, null) so it is never looked up again.
     private val cache = ConcurrentHashMap<String, ContactInfo>()
@@ -30,6 +48,10 @@ object ContactNameResolver {
 
     /** Returns the saved contact photo for [sender], or null when there's no match / no photo. */
     fun photoUri(context: Context, sender: String): Uri? = resolve(context, sender).photoUri
+
+    /** Returns the conversation grouping key for [sender]. */
+    fun conversationKey(context: Context, sender: String): String =
+        resolve(context, sender).conversationKey(sender)
 
     /** Full name + photo lookup; both come from a single PhoneLookup query (then cached). */
     fun resolve(context: Context, sender: String): ContactInfo {
@@ -66,14 +88,18 @@ object ContactNameResolver {
                 uri,
                 arrayOf(
                     ContactsContract.PhoneLookup.DISPLAY_NAME,
-                    ContactsContract.PhoneLookup.PHOTO_URI
+                    ContactsContract.PhoneLookup.PHOTO_URI,
+                    ContactsContract.PhoneLookup.LOOKUP_KEY,
+                    ContactsContract.PhoneLookup._ID
                 ),
                 null, null, null
             )?.use { c ->
                 if (c.moveToFirst()) {
                     val name = c.getString(0)?.takeIf { it.isNotBlank() } ?: return null
                     val photo = c.getString(1)?.takeIf { it.isNotBlank() }?.let { Uri.parse(it) }
-                    ContactInfo(name, photo)
+                    val lookupKey = if (c.columnCount > 2) c.getString(2)?.takeIf { it.isNotBlank() } else null
+                    val contactId = if (c.columnCount > 3 && !c.isNull(3)) c.getLong(3) else null
+                    ContactInfo(name, photo, lookupKey, contactId)
                 } else null
             }
         } catch (e: Exception) {

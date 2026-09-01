@@ -27,11 +27,12 @@ directly.
 
 ## Layers / packages
 
-- `data/` — Room. [SmsEntities.kt](../app/src/main/java/com/example/data/SmsEntities.kt) (4 entities:
-  `SMSMessage`, `FilterRule`, `FinanceTx`, `ReminderSms`), [SmsDao.kt](../app/src/main/java/com/example/data/SmsDao.kt),
-  [SmsDatabase.kt](../app/src/main/java/com/example/data/SmsDatabase.kt) (singleton, `version = 5`,
-  `fallbackToDestructiveMigration` — bump version + migrate if you change entities, or data is wiped),
-  [SmsRepository.kt](../app/src/main/java/com/example/data/SmsRepository.kt). Categories are free-form
+- `config/` — About metadata and configuration loader. [AppConfig.kt](../app/src/main/java/in/sreerajp/sms_sentry/config/AppConfig.kt),
+  [ConfigService.kt](../app/src/main/java/in/sreerajp/sms_sentry/config/ConfigService.kt).
+- `data/` — Room. [SmsEntities.kt](../app/src/main/java/in/sreerajp/sms_sentry/data/SmsEntities.kt) (5 entities:
+  `SMSMessage`, `FilterRule`, `FinanceTx`, `ReminderSms`, `ScheduledSms`), [SmsDao.kt](../app/src/main/java/in/sreerajp/sms_sentry/data/SmsDao.kt),
+  [SmsDatabase.kt](../app/src/main/java/in/sreerajp/sms_sentry/data/SmsDatabase.kt) (singleton, `version = 6`),
+  [SmsRepository.kt](../app/src/main/java/in/sreerajp/sms_sentry/data/SmsRepository.kt). Categories are free-form
   **string literals** — the user-facing taxonomy is just four: `"Personal"`, `"Promotions"`,
   `"Others"`, `"Spam"`; rule types are `"KEYWORD"`/`"CONTACT"`; `"Blocked"` maps to Spam+`isBlocked`,
   `"NotSpam"` allowlists a sender. There is no enum — keep the strings consistent across classifier,
@@ -42,22 +43,24 @@ directly.
   are **derived views** over those rows, not categories. `SmsClassifier.normalizeCategory()` maps
   legacy values (`"Accounts"`/`"Reminder"`/`"Services"`) onto `"Others"`; existing data is re-sorted
   on demand via Settings ▸ Categorization ▸ "Re-categorize all messages"
-  (`repository.recategorizeAllMessages()`) — there is no DB migration for the four-category switch.
-- `engine/` — business logic. [SmsClassifier.kt](../app/src/main/java/com/example/engine/SmsClassifier.kt)
+  (`repository.recategorizeAllMessages()`).
+- `engine/` — business logic. [SmsClassifier.kt](../app/src/main/java/in/sreerajp/sms_sentry/engine/SmsClassifier.kt)
   (custom contact rules → custom keyword rules → built-in heuristics → field extraction for bank/
-  amount/balance/due-date), [P2PSyncEngine.kt](../app/src/main/java/com/example/engine/P2PSyncEngine.kt),
-  [SmsShareUtils.kt](../app/src/main/java/com/example/engine/SmsShareUtils.kt) (CSV/JSON import/export).
-- `ui/` — [SmsOrganizerUi.kt](../app/src/main/java/com/example/ui/SmsOrganizerUi.kt) is a single ~3150-line
-  file holding `SmsOrganizerApp` plus every screen and dialog (Dashboard, Inbox, Accounts, Reminders,
-  Sync, Settings, compose/simulate/import dialogs). [SmsOrganizerViewModel.kt](../app/src/main/java/com/example/ui/SmsOrganizerViewModel.kt)
-  is the only ViewModel; tab navigation is just a `mutableStateOf("Dashboard")` string switch,
-  not Navigation-Compose. `ui/theme/` holds a custom multi-palette theme (`ThemeStyle` enum:
-  LAVENDER/SAGE/etc.) persisted to SharedPreferences `theme_prefs`.
-- `receiver/` — [SmsReceiver.kt](../app/src/main/java/com/example/receiver/SmsReceiver.kt) (SMS_RECEIVED
-  broadcast) and [NotificationActionReceiver.kt](../app/src/main/java/com/example/receiver/NotificationActionReceiver.kt)
+  amount/balance/due-date), [P2PSyncEngine.kt](../app/src/main/java/in/sreerajp/sms_sentry/engine/P2PSyncEngine.kt),
+  [SmsShareUtils.kt](../app/src/main/java/in/sreerajp/sms_sentry/engine/SmsShareUtils.kt) (CSV/JSON import/export).
+- `ui/` — [SmsOrganizerUi.kt](../app/src/main/java/in/sreerajp/sms_sentry/ui/SmsOrganizerUi.kt) holds
+  `SmsOrganizerApp` plus screens and dialogs (Dashboard, Inbox, Accounts, Reminders, Sync, Settings,
+  compose/simulate/import dialogs). [SmsOrganizerViewModel.kt](../app/src/main/java/in/sreerajp/sms_sentry/ui/SmsOrganizerViewModel.kt)
+  is the only ViewModel; tab navigation is a `mutableStateOf` switch. `ui/theme/` holds a custom
+  multi-palette theme (`ThemeStyle` enum: LAVENDER/SAGE/etc.) persisted to SharedPreferences.
+- `receiver/` — [SmsReceiver.kt](../app/src/main/java/in/sreerajp/sms_sentry/receiver/SmsReceiver.kt) (SMS_RECEIVED
+  broadcast), [SmsDeliverReceiver.kt](../app/src/main/java/in/sreerajp/sms_sentry/receiver/SmsDeliverReceiver.kt),
+  [MmsDeliverReceiver.kt](../app/src/main/java/in/sreerajp/sms_sentry/receiver/MmsDeliverReceiver.kt), and
+  [NotificationActionReceiver.kt](../app/src/main/java/in/sreerajp/sms_sentry/receiver/NotificationActionReceiver.kt)
   (Copy OTP / Open / Delete notification actions).
-- `util/` — [SmsNotificationHelper.kt](../app/src/main/java/com/example/util/SmsNotificationHelper.kt)
-  builds themed custom-RemoteView notifications and extracts OTPs.
+- `util/` — [SmsNotificationHelper.kt](../app/src/main/java/in/sreerajp/sms_sentry/util/SmsNotificationHelper.kt)
+  builds themed custom-RemoteView notifications and extracts OTPs. [ContactNameResolver.kt](../app/src/main/java/in/sreerajp/sms_sentry/util/ContactNameResolver.kt)
+  resolves contacts.
 
 ## Things worth knowing before changing behavior
 

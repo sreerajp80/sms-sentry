@@ -31,8 +31,8 @@ android {
     applicationId = "in.sreerajp.sms_sentry"
     minSdk = 24
     targetSdk = 36
-    versionCode = 16
-    versionName = "16.11"
+    versionCode = 18
+    versionName = "16.13"
 
     // Real build date, injected at build time and shown on the About screen.
     val buildDate = SimpleDateFormat("yyyy-MM-dd").format(Date())

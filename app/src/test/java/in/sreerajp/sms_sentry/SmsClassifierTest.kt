@@ -324,4 +324,143 @@ class SmsClassifierTest {
         )
         assertEquals("Others", result.category)
     }
+
+    // ---- Enhanced date parsing tests (ordinals, month-first) -----------------------------
+
+    @Test
+    fun `ordinal alpha date parses correctly as reminder due date`() {
+        val ref = dateMillis("01 Jan 2026")
+        val result = SmsClassifier.classify(
+            sender = "VM-MoRTH",
+            body = "Your PUCC will expire on 25th May 2026. Kindly renew before expiry.",
+            customKeywords = noRules,
+            customContacts = emptyMap(),
+            referenceTime = ref
+        )
+        assertTrue(result.isReminder)
+        assertEquals(dateMillis("25 May 2026"), result.dueDate)
+    }
+
+    @Test
+    fun `month-first date format parses correctly as reminder due date`() {
+        val ref = dateMillis("01 Jan 2026")
+        val result = SmsClassifier.classify(
+            sender = "VM-AIRTEL",
+            body = "Your bill payment of Rs. 799 is due on May 25, 2026. Please pay before due date.",
+            customKeywords = noRules,
+            customContacts = emptyMap(),
+            referenceTime = ref
+        )
+        assertTrue(result.isReminder)
+        assertEquals(dateMillis("25 May 2026"), result.dueDate)
+    }
+
+    // ---- Enhanced finance extraction tests (verbs, balances, currencies, banks) ----------
+
+    @Test
+    fun `deducted and charged verbs are extracted as debits`() {
+        val resultDeducted = SmsClassifier.classify(
+            sender = "VM-CANBNK",
+            body = "Rs. 499.00 deducted from your Canara Bank A/c for Netflix. Avl Bal Rs. 15,000.00",
+            customKeywords = noRules,
+            customContacts = emptyMap()
+        )
+        assertTrue(resultDeducted.isFinance)
+        assertEquals(false, resultDeducted.isCredit)
+        assertEquals(499.0, resultDeducted.amount!!, 0.001)
+        assertEquals(15000.0, resultDeducted.balance!!, 0.001)
+        assertEquals("CANBNK", resultDeducted.bankName)
+
+        val resultCharged = SmsClassifier.classify(
+            sender = "VM-IDFCFIRST",
+            body = "Your IDFC card was charged Rs 1250.00 at Grocery Store. Avl Bal: Rs 48,000",
+            customKeywords = noRules,
+            customContacts = emptyMap()
+        )
+        assertTrue(resultCharged.isFinance)
+        assertEquals(false, resultCharged.isCredit)
+        assertEquals(1250.0, resultCharged.amount!!, 0.001)
+        assertEquals(48000.0, resultCharged.balance!!, 0.001)
+        assertEquals("IDFCFIRST", resultCharged.bankName)
+    }
+
+    @Test
+    fun `auto-debited and withdrawal verbs are extracted as debits`() {
+        val resultAutoDebit = SmsClassifier.classify(
+            sender = "VM-FEDBNK",
+            body = "Rs 2000.00 auto-debited from Federal Bank A/c XX1234. Net Bal: Rs 32,500.00",
+            customKeywords = noRules,
+            customContacts = emptyMap()
+        )
+        assertTrue(resultAutoDebit.isFinance)
+        assertEquals(false, resultAutoDebit.isCredit)
+        assertEquals(2000.0, resultAutoDebit.amount!!, 0.001)
+        assertEquals(32500.0, resultAutoDebit.balance!!, 0.001)
+        assertEquals("FEDBNK", resultAutoDebit.bankName)
+
+        val resultWithdrawal = SmsClassifier.classify(
+            sender = "VM-UNIONB",
+            body = "Cash withdrawal of Rs 5000 from Union Bank ATM. Avl Bal Rs 10000",
+            customKeywords = noRules,
+            customContacts = emptyMap()
+        )
+        assertTrue(resultWithdrawal.isFinance)
+        assertEquals(false, resultWithdrawal.isCredit)
+        assertEquals(5000.0, resultWithdrawal.amount!!, 0.001)
+        assertEquals(10000.0, resultWithdrawal.balance!!, 0.001)
+        assertEquals("UNIONB", resultWithdrawal.bankName)
+    }
+
+    @Test
+    fun `deposited verb is extracted as credit`() {
+        val result = SmsClassifier.classify(
+            sender = "VM-BARODA",
+            body = "Rs. 8,500.00 deposited to your Bank of Baroda account. Avl Bal Rs. 25,000.00",
+            customKeywords = noRules,
+            customContacts = emptyMap()
+        )
+        assertTrue(result.isFinance)
+        assertEquals(true, result.isCredit)
+        assertEquals(8500.0, result.amount!!, 0.001)
+        assertEquals(25000.0, result.balance!!, 0.001)
+        assertEquals("BARODA", result.bankName)
+    }
+
+    // ---- Enhanced modern scam detection tests --------------------------------------------
+
+    @Test
+    fun `electricity disconnection scam is classified as Spam`() {
+        val result = SmsClassifier.classify(
+            sender = "VM-POWERT",
+            body = "Dear Customer, Your electricity power will be disconnected tonight. Call electricity officer at 9876543210 immediately!",
+            customKeywords = noRules,
+            customContacts = emptyMap()
+        )
+        assertEquals("Spam", result.category)
+        assertTrue(result.isBlocked)
+    }
+
+    @Test
+    fun `apk download phishing scam is classified as Spam`() {
+        val result = SmsClassifier.classify(
+            sender = "VM-UPDATE",
+            body = "Your KYC suspended! Download apk from bit.ly/kycupdate to avoid account suspended immediately.",
+            customKeywords = noRules,
+            customContacts = emptyMap()
+        )
+        assertEquals("Spam", result.category)
+        assertTrue(result.isBlocked)
+    }
+
+    @Test
+    fun `telegram task daily income scam is classified as Spam`() {
+        val result = SmsClassifier.classify(
+            sender = "VK-OFFER",
+            body = "Work from home! Earn daily income with telegram task. Earn money daily, contact on whatsapp at wa.me/9199999 now, hurry!",
+            customKeywords = noRules,
+            customContacts = emptyMap()
+        )
+        assertEquals("Spam", result.category)
+        assertTrue(result.isBlocked)
+    }
 }

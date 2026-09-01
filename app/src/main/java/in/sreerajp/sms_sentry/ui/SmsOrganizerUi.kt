@@ -5,7 +5,10 @@ import android.app.KeyguardManager
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.widget.Toast
+import `in`.sreerajp.sms_sentry.engine.MessageEntityExtractor
+import `in`.sreerajp.sms_sentry.engine.EntityType
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -23,6 +26,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.DriveFileMove
+import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.automirrored.filled.TrendingDown
 import androidx.compose.material.icons.automirrored.filled.TrendingUp
@@ -93,12 +97,12 @@ import `in`.sreerajp.sms_sentry.ui.theme.goodColor
 import `in`.sreerajp.sms_sentry.ui.theme.goodSoftColor
 import `in`.sreerajp.sms_sentry.ui.theme.spamColor
 import `in`.sreerajp.sms_sentry.ui.theme.spamSoftColor
-import `in`.sreerajp.sms_sentry.util.AboutInfo
+import `in`.sreerajp.sms_sentry.config.AppConfig
+import `in`.sreerajp.sms_sentry.config.ConfigService
 import `in`.sreerajp.sms_sentry.util.RecurrenceUtil
 import `in`.sreerajp.sms_sentry.util.SimManager
 import `in`.sreerajp.sms_sentry.util.SmsSegment
 import `in`.sreerajp.sms_sentry.util.ContactNameResolver
-import `in`.sreerajp.sms_sentry.util.loadAboutConfig
 import `in`.sreerajp.sms_sentry.BuildConfig
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -1516,17 +1520,18 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
                     verticalArrangement = Arrangement.spacedBy(11.dp)
                 ) {
                     items(searchResults, key = { it.id }) { msg ->
+                        val threadKey = viewModel.conversationKeyFor(msg.sender)
                         SearchResultCard(
                             msg = msg,
-                            selected = msg.sender in selectedSenders,
+                            selected = threadKey in selectedSenders || msg.sender in selectedSenders,
                             selectionMode = selectionMode,
                             onClick = {
-                                if (selectionMode) toggle(msg.sender)
-                                else viewModel.openThread(msg.sender)
+                                if (selectionMode) toggle(threadKey)
+                                else viewModel.openThread(threadKey)
                             },
                             onLongClick = {
                                 if (!selectionMode) selectionMode = true
-                                toggle(msg.sender)
+                                toggle(threadKey)
                             }
                         )
                     }
@@ -1563,14 +1568,18 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
                 }
             }
         } else {
-            // Group the filtered messages into per-sender conversations (one card per sender).
-            val conversations = remember(filteredMessages) {
+            val contactKeys by viewModel.contactKeys.collectAsState()
+            // Group the filtered messages into per-contact/per-sender conversations (one card per contact/sender).
+            val conversations = remember(filteredMessages, contactKeys) {
                 filteredMessages
-                    .groupBy { it.sender }
-                    .map { (sender, msgs) ->
+                    .groupBy { viewModel.conversationKeyFor(it.sender) }
+                    .map { (key, msgs) ->
                         val latest = msgs.maxByOrNull { it.timestamp }!!
+                        val senders = msgs.mapTo(HashSet()) { it.sender }
                         Conversation(
-                            sender = sender,
+                            threadKey = key,
+                            sender = latest.sender,
+                            senders = senders,
                             latest = latest,
                             unreadCount = msgs.count { !it.isRead && it.type == SMSMessage.TYPE_INBOX },
                             total = msgs.size
@@ -1592,26 +1601,26 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
             ) {
                 grouped.forEach { (bucket, convs) ->
                     item(key = "header_$bucket") { DateSectionHeader(bucket) }
-                    items(convs, key = { it.sender }) { conv ->
+                    items(convs, key = { it.threadKey }) { conv ->
                         val entityText = remember(conv.latest.id, txByMsg, reminderByMsg) {
                             messageEntityText(conv.latest, txByMsg[conv.latest.id], reminderByMsg[conv.latest.id])
                         }
                         ConversationCard(
                             conversation = conv,
                             entityText = entityText,
-                            draft = drafts[conv.sender]?.takeIf { it.isNotBlank() },
-                            selected = conv.sender in selectedSenders,
+                            draft = (drafts[conv.threadKey] ?: drafts[conv.sender])?.takeIf { it.isNotBlank() },
+                            selected = conv.threadKey in selectedSenders || conv.sender in selectedSenders,
                             selectionMode = selectionMode,
                             onClick = {
-                                if (selectionMode) toggle(conv.sender)
-                                else viewModel.openThread(conv.sender)
+                                if (selectionMode) toggle(conv.threadKey)
+                                else viewModel.openThread(conv.threadKey)
                             },
                             onLongClick = {
                                 if (!selectionMode) selectionMode = true
-                                toggle(conv.sender)
+                                toggle(conv.threadKey)
                             },
-                            onDelete = { viewModel.deleteConversation(conv.sender) },
-                            onBlock = { viewModel.blockConversation(conv.sender) }
+                            onDelete = { viewModel.deleteConversation(conv.threadKey) },
+                            onBlock = { viewModel.blockConversation(conv.threadKey) }
                         )
                     }
                 }
@@ -1625,9 +1634,11 @@ fun InboxScreen(viewModel: SmsOrganizerViewModel) {
 // CONVERSATIONS (grouped per-sender inbox + thread view)
 // ==========================================
 
-/** A per-sender conversation summary for the grouped inbox list. */
+/** A conversation summary for the grouped inbox list (aggregated per contact or non-contact sender). */
 data class Conversation(
+    val threadKey: String,
     val sender: String,
+    val senders: Set<String> = setOf(sender),
     val latest: SMSMessage,
     val unreadCount: Int,
     val total: Int
@@ -1794,7 +1805,9 @@ fun ConversationCard(
     val msg = conversation.latest
     val categoryColor = categoryColor(msg.category)
     val hasUnread = conversation.unreadCount > 0
-    val otp = remember(msg.body) { detectOtp(msg.body) }
+    val entities = remember(msg.body) { MessageEntityExtractor.extractEntities(msg.body) }
+    val otp = remember(entities) { entities.find { it.type == EntityType.OTP }?.value }
+    val trackingId = remember(entities) { entities.find { it.type == EntityType.TRACKING_ID }?.value }
     val timeText = remember(msg.timestamp) {
         SimpleDateFormat("hh:mm a", Locale.getDefault()).format(Date(msg.timestamp))
     }
@@ -1986,7 +1999,7 @@ fun ConversationCard(
                     }
                 }
 
-                if (entityText != null || otp != null) {
+                if (entityText != null || otp != null || trackingId != null) {
                     Spacer(modifier = Modifier.height(8.dp))
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
@@ -1994,6 +2007,7 @@ fun ConversationCard(
                     ) {
                         if (entityText != null) EntityChip(entityText)
                         if (otp != null) CopyOtpChip(otp, msg.id)
+                        else if (trackingId != null) CopyTrackingChip(trackingId, msg.id)
                     }
                 }
             }
@@ -2007,8 +2021,11 @@ fun ConversationCard(
 @Composable
 fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
     val allMessages by viewModel.allMessages.collectAsState()
-    val threadMessages = remember(allMessages, sender) {
-        allMessages.filter { it.sender == sender }.sortedBy { it.timestamp }
+    val contactKeys by viewModel.contactKeys.collectAsState()
+    val threadMessages = remember(allMessages, contactKeys, sender) {
+        val senders = viewModel.sendersForConversation(sender)
+        allMessages.filter { it.sender in senders || viewModel.conversationKeyFor(it.sender) == sender }
+            .sortedBy { it.timestamp }
     }
     val categoryColor = categoryColor(threadMessages.lastOrNull()?.category ?: "Personal")
     // Restore any saved draft for this thread; persist it again when leaving (see DisposableEffect).
@@ -2261,16 +2278,24 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                         modifier = Modifier.size(20.dp)
                     )
                 }
-                val senderName = displayNameFor(sender)
+                val latestSender = threadMessages.lastOrNull()?.sender ?: sender
+                val senderName = displayNameFor(latestSender)
                 AvatarTile(
                     label = senderName.take(1).uppercase(Locale.getDefault()),
                     color = categoryColor,
                     size = 38.dp,
                     corner = 12.dp,
                     fontSize = 16.sp,
-                    photoUri = photoUriFor(sender)
+                    photoUri = photoUriFor(latestSender)
                 )
                 Spacer(modifier = Modifier.width(10.dp))
+                val uniqueNumbersCount = remember(threadMessages) {
+                    threadMessages.map { it.sender }.distinct().size
+                }
+                val subtitleText = when {
+                    uniqueNumbersCount > 1 -> "${threadMessages.size} messages · $uniqueNumbersCount numbers"
+                    else -> "${threadMessages.size} message${if (threadMessages.size == 1) "" else "s"}"
+                }
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = senderName,
@@ -2281,7 +2306,7 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                         overflow = TextOverflow.Ellipsis
                     )
                     Text(
-                        text = "${threadMessages.size} message${if (threadMessages.size == 1) "" else "s"}",
+                        text = subtitleText,
                         fontSize = 10.5.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.5f)
@@ -2518,11 +2543,14 @@ fun ThreadScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                     )
                 }
                 val canSend = replyText.trim().isNotEmpty()
+                val replyRecipient = threadMessages.lastOrNull { it.type == SMSMessage.TYPE_INBOX }?.sender
+                    ?: threadMessages.lastOrNull()?.sender
+                    ?: sender
                 TooltipIconButton(
                     tooltip = "Send",
                     onClick = {
                         if (canSend) {
-                            viewModel.sendSms(sender, replyText.trim(), viewModel.defaultOutgoingSlot())
+                            viewModel.sendSms(replyRecipient, replyText.trim(), viewModel.defaultOutgoingSlot())
                             replyText = ""
                             viewModel.clearDraft(sender)
                         }
@@ -2666,8 +2694,12 @@ private fun ThreadBubble(
                             }
                             Spacer(modifier = Modifier.height(4.dp))
                         }
+                        val isDark = isSystemInDarkTheme()
+                        val annotatedBody = remember(msg.body, isDark) {
+                            MessageEntityExtractor.buildAnnotatedMessageBody(msg.body, isDarkTheme = isDark)
+                        }
                         Text(
-                            text = msg.body,
+                            text = annotatedBody,
                             fontSize = 13.5.sp,
                             lineHeight = 19.sp,
                             color = textColor
@@ -2702,6 +2734,12 @@ private fun ThreadBubble(
                                 else MaterialTheme.colorScheme.onBackground.copy(alpha = 0.55f)
                     )
                 }
+                val simSlot = if (msg.simId > 0) msg.simId else 1
+                Text(
+                    text = " · SIM $simSlot",
+                    fontSize = 9.5.sp,
+                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.45f)
+                )
                 // A failed send can be retried in place.
                 if (msg.status == SMSMessage.STATUS_FAILED) {
                     Text(
@@ -2722,7 +2760,8 @@ private fun ThreadBubble(
 // ==========================================
 
 private val OTP_KEYWORDS = listOf(
-    "otp", "verification", "code", "passcode", "pin", "password", "security", "one-time", "secret"
+    "otp", "verification", "code", "passcode", "pin", "password", "security", "one-time", "secret",
+    "ലോഗിൻ", "ഒ.ടി.പി", "പാസ്‌വേഡ്", "രഹസ്യകോഡ്"
 )
 
 // Regex for prefixes indicating card, account, ID, or currency amount (making it not an OTP)
@@ -2730,63 +2769,9 @@ private val INVALID_PREFIX_REGEX = Regex(
     "(?i)(?:\\b(?:a/c|acct|account|card|uan|id|ref|txn|transaction|refid|reference|otp-id|otpid|number|no|ending in|ending with|rs|inr|usd)\\b[\\s:-]*|\\$[\\s]*|₹[\\s]*|[Xx\\*·•\\s-]*[Xx\\*·•]+[\\s-]*)$"
 )
 
-// Regex for suffixes indicating units of measurement/data/money/time (making it not an OTP)
-private val INVALID_SUFFIX_REGEX = Regex(
-    "^(?i)[\\s:-]*(?:gb|mb|kb|tb|mah|hz|ghz|rs|inr|usd|pts|points|mins|min|sec|seconds|days|hours|weeks|months|yr|years|am|pm|v|w|kw|l|ml|kg|g|km|m|cm|inch|in|ft|yards|miles|per|percent|%|units|items|pcs|pieces)\\b"
-)
-
 /** Returns the OTP code in a message body if it looks like a verification message, else null. */
 fun detectOtp(body: String): String? {
-    val lower = body.lowercase(Locale.getDefault())
-    if (OTP_KEYWORDS.none { lower.contains(it) }) return null
-
-    val candidateMatches = Regex("\\b\\d{4,8}\\b").findAll(body).toList()
-    if (candidateMatches.isEmpty()) return null
-
-    val validCandidates = candidateMatches.filter { match ->
-        val start = match.range.first
-        val end = match.range.last + 1
-        val prefix = body.substring(0, start)
-        val suffix = body.substring(end)
-
-        // Check if candidate is preceded by card/account/ID markers or currency symbols
-        if (INVALID_PREFIX_REGEX.containsMatchIn(prefix)) return@filter false
-
-        // Check if candidate is followed by data/time/money/count units
-        if (INVALID_SUFFIX_REGEX.containsMatchIn(suffix)) return@filter false
-
-        true
-    }
-
-    if (validCandidates.isEmpty()) return null
-    if (validCandidates.size == 1) return validCandidates.first().value
-
-    // If multiple valid candidates, score/rank them by character distance to the nearest OTP keyword in the message body
-    val keywordIndices = mutableListOf<Int>()
-    for (keyword in OTP_KEYWORDS) {
-        var idx = lower.indexOf(keyword)
-        while (idx != -1) {
-            keywordIndices.add(idx)
-            idx = lower.indexOf(keyword, idx + 1)
-        }
-    }
-
-    if (keywordIndices.isEmpty()) {
-        return validCandidates.first().value
-    }
-
-    // Pick the candidate closest to any keyword index
-    return validCandidates.minByOrNull { match ->
-        val candidateStart = match.range.first
-        var minDistance = Int.MAX_VALUE
-        for (kwIdx in keywordIndices) {
-            val dist = kotlin.math.abs(candidateStart - kwIdx)
-            if (dist < minDistance) {
-                minDistance = dist
-            }
-        }
-        minDistance
-    }?.value
+    return MessageEntityExtractor.extractEntities(body).find { it.type == EntityType.OTP }?.value
 }
 
 /** Indian-grouped rupee formatter; drops the decimals when the amount is a whole number. */
@@ -2883,10 +2868,21 @@ fun AvatarTile(
 fun SenderInfoScreen(viewModel: SmsOrganizerViewModel, sender: String) {
     val context = LocalContext.current
     val allMessages by viewModel.allMessages.collectAsState()
-    val msgs = remember(allMessages, sender) { allMessages.filter { it.sender == sender } }
+    val contactKeys by viewModel.contactKeys.collectAsState()
+    val msgs = remember(allMessages, contactKeys, sender) {
+        val senders = viewModel.sendersForConversation(sender)
+        allMessages.filter { it.sender in senders || viewModel.conversationKeyFor(it.sender) == sender }
+    }
+    val associatedNumbers = remember(msgs, sender) {
+        val resolved = viewModel.sendersForConversation(sender)
+        (msgs.map { it.sender } + resolved + listOf(sender))
+            .filter { it.isNotBlank() && !it.startsWith("contact:") }
+            .distinct()
+    }
+    val latestSender = msgs.maxByOrNull { it.timestamp }?.sender ?: associatedNumbers.firstOrNull() ?: sender
 
-    val senderName = displayNameFor(sender)
-    val photoUri = photoUriFor(sender)
+    val senderName = displayNameFor(latestSender)
+    val photoUri = photoUriFor(latestSender)
     val accent = categoryColor(msgs.maxByOrNull { it.timestamp }?.category ?: "Personal")
 
     val received = msgs.count { it.type == SMSMessage.TYPE_INBOX }
@@ -2961,12 +2957,13 @@ fun SenderInfoScreen(viewModel: SmsOrganizerViewModel, sender: String) {
                 color = MaterialTheme.colorScheme.onBackground,
                 textAlign = TextAlign.Center
             )
-            if (senderName != sender) {
+            if (associatedNumbers.isNotEmpty() && (senderName != latestSender || associatedNumbers.size > 1)) {
                 Text(
-                    text = sender,
+                    text = associatedNumbers.joinToString(", "),
                     fontSize = 13.sp,
                     fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.55f)
+                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.55f),
+                    textAlign = TextAlign.Center
                 )
             }
 
@@ -3205,6 +3202,31 @@ internal fun CopyOtpChip(otp: String, msgId: Long) {
     }
 }
 
+@Composable
+internal fun CopyTrackingChip(trackingId: String, msgId: Long) {
+    val clipboardManager = LocalClipboardManager.current
+    val context = LocalContext.current
+    FilledTonalButton(
+        onClick = {
+            clipboardManager.setText(AnnotatedString(trackingId))
+            Toast.makeText(context, "Tracking number $trackingId copied!", Toast.LENGTH_SHORT).show()
+        },
+        modifier = Modifier
+            .height(34.dp)
+            .testTag("copy_tracking_button_$msgId"),
+        colors = ButtonDefaults.filledTonalButtonColors(
+            containerColor = Color(0xFFFFB300).copy(alpha = 0.18f),
+            contentColor = Color(0xFFE0A900)
+        ),
+        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+        shape = RoundedCornerShape(11.dp)
+    ) {
+        Icon(imageVector = Icons.Default.LocalShipping, contentDescription = "Copy Tracking", modifier = Modifier.size(14.dp))
+        Spacer(modifier = Modifier.width(5.dp))
+        Text("Copy Tracking ($trackingId)", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+    }
+}
+
 /** A single behind-the-card swipe action (Block / Delete). */
 @Composable
 private fun SwipeAction(
@@ -3356,30 +3378,20 @@ fun MessageDetailScreen(viewModel: SmsOrganizerViewModel, msg: SMSMessage) {
     val tx = remember(transactions, msg.id) { transactions.firstOrNull { it.messageId == msg.id } }
     val reminder = remember(reminders, msg.id) { reminders.firstOrNull { it.messageId == msg.id } }
     val categoryColor = categoryColor(msg.category)
-    val otp = remember(msg.body) { detectOtp(msg.body) }
+    val entities = remember(msg.body) { MessageEntityExtractor.extractEntities(msg.body) }
+    val otp = remember(entities) { entities.find { it.type == EntityType.OTP }?.value }
+    val trackingId = remember(entities) { entities.find { it.type == EntityType.TRACKING_ID }?.value }
+    val url = remember(entities) { entities.find { it.type == EntityType.URL }?.value }
+    val phone = remember(entities) { entities.find { it.type == EntityType.PHONE_NUMBER }?.value }
 
     val isPaid = viewModel.paidMessageIds.value.contains(msg.id)
 
     val dateText = remember(msg.timestamp) {
         SimpleDateFormat("dd MMM · hh:mm a", Locale.getDefault()).format(Date(msg.timestamp))
     }
-    val annotatedBody = remember(msg.body, otp) {
-        buildAnnotatedString {
-            if (otp != null) {
-                val i = msg.body.indexOf(otp)
-                if (i >= 0) {
-                    append(msg.body.substring(0, i))
-                    withStyle(
-                        SpanStyle(
-                            color = Color(0xFFE0A900),
-                            fontWeight = FontWeight.ExtraBold,
-                            background = Color(0xFFFFB300).copy(alpha = 0.15f)
-                        )
-                    ) { append(otp) }
-                    append(msg.body.substring(i + otp.length))
-                } else append(msg.body)
-            } else append(msg.body)
-        }
+    val isDark = isSystemInDarkTheme()
+    val annotatedBody = remember(msg.body, isDark) {
+        MessageEntityExtractor.buildAnnotatedMessageBody(msg.body, isDarkTheme = isDark)
     }
 
     Column(
@@ -3551,6 +3563,13 @@ fun MessageDetailScreen(viewModel: SmsOrganizerViewModel, msg: SMSMessage) {
                                 else MaterialTheme.colorScheme.onBackground.copy(alpha = 0.55f)
                     )
                 }
+                val simSlot = if (msg.simId > 0) msg.simId else 1
+                Text(
+                    text = " · SIM $simSlot",
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.45f)
+                )
             }
 
             // Smart card — detected entities
@@ -3593,6 +3612,97 @@ fun MessageDetailScreen(viewModel: SmsOrganizerViewModel, msg: SMSMessage) {
                     Icon(imageVector = Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
                     Spacer(modifier = Modifier.width(7.dp))
                     Text("Copy OTP ($otp)", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            // Copy Tracking ID (full-width) when present
+            if (trackingId != null) {
+                Spacer(modifier = Modifier.height(if (otp != null) 8.dp else 16.dp))
+                FilledTonalButton(
+                    onClick = {
+                        clipboardManager.setText(AnnotatedString(trackingId))
+                        Toast.makeText(context, "Tracking number $trackingId copied!", Toast.LENGTH_SHORT).show()
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(46.dp)
+                        .testTag("detail_copy_tracking_${msg.id}"),
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                        containerColor = Color(0xFFFFB300).copy(alpha = 0.18f),
+                        contentColor = Color(0xFFE0A900)
+                    ),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Icon(imageVector = Icons.Default.LocalShipping, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(7.dp))
+                    Text("Copy Tracking No ($trackingId)", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            // Open URL link (full-width) when present
+            if (url != null) {
+                Spacer(modifier = Modifier.height(if (otp != null || trackingId != null) 8.dp else 16.dp))
+                val formattedUrl = if (url.startsWith("http://", ignoreCase = true) || url.startsWith("https://", ignoreCase = true)) {
+                    url
+                } else {
+                    "https://$url"
+                }
+                FilledTonalButton(
+                    onClick = {
+                        try {
+                            val intent = Intent(Intent.ACTION_VIEW, Uri.parse(formattedUrl)).apply {
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            context.startActivity(intent)
+                        } catch (e: Exception) {
+                            clipboardManager.setText(AnnotatedString(url))
+                            Toast.makeText(context, "Link copied: $url", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(46.dp)
+                        .testTag("detail_open_url_${msg.id}"),
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                        containerColor = MaterialTheme.colorScheme.primaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+                    ),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Icon(imageVector = Icons.AutoMirrored.Filled.OpenInNew, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(7.dp))
+                    Text("Open Link", fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+
+            // Call Phone Number when present and no OTP/tracking
+            if (phone != null && otp == null && trackingId == null) {
+                Spacer(modifier = Modifier.height(if (url != null) 8.dp else 16.dp))
+                FilledTonalButton(
+                    onClick = {
+                        try {
+                            val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:$phone")).apply {
+                                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                            }
+                            context.startActivity(intent)
+                        } catch (e: Exception) {
+                            clipboardManager.setText(AnnotatedString(phone))
+                            Toast.makeText(context, "Phone number copied", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(46.dp)
+                        .testTag("detail_call_phone_${msg.id}"),
+                    colors = ButtonDefaults.filledTonalButtonColors(
+                        containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                        contentColor = MaterialTheme.colorScheme.onSecondaryContainer
+                    ),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Icon(imageVector = Icons.Default.Phone, contentDescription = null, modifier = Modifier.size(16.dp))
+                    Spacer(modifier = Modifier.width(7.dp))
+                    Text("Call ($phone)", fontSize = 13.sp, fontWeight = FontWeight.Bold)
                 }
             }
 
@@ -6647,12 +6757,15 @@ private fun AdvancedSettingsPage(
 }
 
 // ------------------------------------------------------------------
-// About sub-page: values sourced from assets/about_config.json
+// About sub-page: values sourced from assets/config/app_config.json
 // ------------------------------------------------------------------
 @Composable
 private fun AboutPage(onBack: () -> Unit) {
     val context = LocalContext.current
-    val about: AboutInfo = remember { loadAboutConfig(context) }
+    val config: AppConfig = remember { ConfigService.load(context) }
+    val detailsList = remember(config) {
+        config.details.entries.filter { it.key.isNotBlank() && it.value.isNotBlank() }
+    }
 
     LazyColumn(
         modifier = Modifier
@@ -6683,29 +6796,72 @@ private fun AboutPage(onBack: () -> Unit) {
                         modifier = Modifier.size(34.dp)
                     )
                 }
-                Text("SMS Sentry", fontSize = 20.sp, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.onBackground)
                 Text(
-                    "v${BuildConfig.VERSION_NAME} · Offline build",
+                    config.appName.ifBlank { "SMS Sentry" },
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.ExtraBold,
+                    color = MaterialTheme.colorScheme.onBackground
+                )
+                Text(
+                    "v${config.version} (Build ${config.build}) · Offline build",
                     fontSize = 12.sp,
                     fontWeight = FontWeight.SemiBold,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                if (config.description.isNotBlank()) {
+                    Text(
+                        config.description,
+                        fontSize = 13.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(horizontal = 24.dp)
+                    )
+                }
             }
         }
 
         // Values card
-        item {
-            Card(
-                modifier = Modifier.fillMaxWidth(),
-                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
-                border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant),
-                shape = RoundedCornerShape(20.dp)
-            ) {
-                Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
-                    AboutRow(Icons.Default.Person, "Author", about.author, true)
-                    AboutRow(Icons.Default.Event, "Last Build Date", about.lastBuildDate, true)
-                    AboutRow(Icons.Default.Code, "IDE Used", about.ideUsed, true)
-                    AboutRow(Icons.Default.AutoAwesome, "AI Used", about.aiUsed, false)
+        if (detailsList.isNotEmpty()) {
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+                    border = BorderStroke(1.dp, MaterialTheme.colorScheme.surfaceVariant),
+                    shape = RoundedCornerShape(20.dp)
+                ) {
+                    Column(modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp)) {
+                        detailsList.forEachIndexed { index, (key, value) ->
+                            val isLast = index == detailsList.size - 1
+                            val icon = when {
+                                key.contains("author", ignoreCase = true) -> Icons.Default.Person
+                                key.contains("date", ignoreCase = true) || key.contains("build", ignoreCase = true) -> Icons.Default.Event
+                                key.contains("ide", ignoreCase = true) || key.contains("code", ignoreCase = true) -> Icons.Default.Code
+                                key.contains("ai", ignoreCase = true) -> Icons.Default.AutoAwesome
+                                key.contains("license", ignoreCase = true) -> Icons.Default.Description
+                                key.contains("email", ignoreCase = true) -> Icons.Default.Email
+                                else -> Icons.Default.Info
+                            }
+                            val isEmail = key.equals("email", ignoreCase = true)
+                            val onClick: (() -> Unit)? = if (isEmail) {
+                                {
+                                    try {
+                                        val intent = Intent(Intent.ACTION_SENDTO).apply {
+                                            data = android.net.Uri.parse("mailto:$value")
+                                        }
+                                        context.startActivity(intent)
+                                    } catch (_: Exception) {}
+                                }
+                            } else null
+
+                            AboutRow(
+                                icon = icon,
+                                label = key,
+                                value = value,
+                                showDivider = !isLast,
+                                onClick = onClick
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -6715,9 +6871,18 @@ private fun AboutPage(onBack: () -> Unit) {
 }
 
 @Composable
-private fun AboutRow(icon: ImageVector, label: String, value: String, showDivider: Boolean) {
+private fun AboutRow(
+    icon: ImageVector,
+    label: String,
+    value: String,
+    showDivider: Boolean,
+    onClick: (() -> Unit)? = null
+) {
     Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (onClick != null) Modifier.clickable { onClick() } else Modifier)
+            .padding(vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Box(
